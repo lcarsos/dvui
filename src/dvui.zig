@@ -280,6 +280,7 @@ pub fn toggleDebugWindow() void {
     cw.debug.open = !cw.debug.open;
 }
 
+// Widget tracking & placement {{{
 pub const TagData = struct {
     id: WidgetId,
     rect: Rect.Physical,
@@ -482,6 +483,638 @@ pub fn placeOnScreen(screen: Rect.Natural, spawner: Rect.Natural, avoid: PlaceOn
     return r;
 }
 
+/// Set snap_to_pixels setting.  If true:
+/// * fonts are rendered at @floor(font.size)
+/// * drawing is generally rounded to the nearest pixel
+///
+/// Returns the previous setting.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn snapToPixelsSet(snap: bool) bool {
+    const cw = currentWindow();
+    const old = cw.snap_to_pixels;
+    cw.snap_to_pixels = snap;
+    return old;
+}
+
+/// Get current snap_to_pixels setting.  See `snapToPixelsSet`.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn snapToPixels() bool {
+    const cw = currentWindow();
+    return cw.snap_to_pixels;
+}
+
+/// Used to track which widget holds mouse capture.
+pub const CaptureMouse = struct {
+    /// widget ID
+    id: WidgetId,
+    /// physical pixels (aka capture zone)
+    rect: Rect.Physical,
+    /// subwindow id the widget with capture is in
+    subwindow_id: WidgetId,
+};
+
+/// Capture the mouse for this widget's data.
+/// (i.e. `eventMatch` return true for this widget and false for all others)
+/// and capture is explicitly released when passing `null`.
+///
+/// Tracks the widget's id / subwindow / rect, so that `.position` mouse events can still
+/// be presented to widgets who's rect overlap with the widget holding the capture.
+/// (which is what you would expect for e.g. background highlight)
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn captureMouse(wd: ?*const WidgetData, event_num: u16) void {
+    const cm = if (wd) |data| CaptureMouse{
+        .id = data.id,
+        .rect = data.borderRectScale().r,
+        .subwindow_id = subwindowCurrentId(),
+    } else null;
+    captureMouseCustom(cm, event_num);
+}
+/// In most cases, use `captureMouse` but if you want to customize the
+/// "capture zone" you can use this function instead.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn captureMouseCustom(cm: ?CaptureMouse, event_num: u16) void {
+    const cw = currentWindow();
+    defer cw.capture = cm;
+    if (cm) |capture| {
+        // log.debug("Mouse capture (event {d}): {any}", .{ event_num, cm });
+        cw.captured_last_frame = true;
+        cw.captureEventsInternal(event_num, capture.id);
+    } else {
+        // Unmark all following mouse events
+        cw.captureEventsInternal(event_num, null);
+        // log.debug("Mouse uncapture (event {d}): {?any}", .{ event_num, cw.capture });
+        // for (dvui.events()) |*e| {
+        //     if (e.evt == .mouse) {
+        //         log.debug("{s}: win {?x}, widget {?x}", .{ @tagName(e.evt.mouse.action), e.target_windowId, e.target_widgetId });
+        //     }
+        // }
+    }
+}
+/// If the widget ID passed has mouse capture, this maintains that capture for
+/// the next frame.  This is usually called for you in `WidgetData.init`.
+///
+/// This can be called every frame regardless of capture.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn captureMouseMaintain(cm: CaptureMouse) void {
+    const cw = currentWindow();
+    if (cw.capture != null and cw.capture.?.id == cm.id) {
+        // to maintain capture, we must be on or above the
+        // top modal window
+        var i = cw.subwindows.items.len;
+        while (i > 0) : (i -= 1) {
+            const sw = &cw.subwindows.items[i - 1];
+            if (sw.id == cw.subwindow_currentId) {
+                // maintaining capture
+                // either our floating window is above the top modal
+                // or there are no floating modal windows
+                cw.capture.?.rect = cm.rect;
+                cw.captured_last_frame = true;
+                return;
+            } else if (sw.modal) {
+                // found modal before we found current
+                // cancel the capture, and cancel
+                // any drag being done
+                //
+                // mark all events as not captured, we are being interrupted by
+                // a modal dialog anyway
+                captureMouse(null, 0);
+                dragEnd();
+                return;
+            }
+        }
+    }
+}
+
+/// Test if the passed widget ID currently has mouse capture.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn captured(id: WidgetId) bool {
+    if (captureMouseGet()) |cm| {
+        return id == cm.id;
+    }
+    return false;
+}
+
+/// Get the widget ID that currently has mouse capture or null if none.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn captureMouseGet() ?CaptureMouse {
+    return currentWindow().capture;
+}
+
+/// Get current screen rectangle in pixels that drawing is being clipped to.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn clipGet() Rect.Physical {
+    return currentWindow().clipRect;
+}
+
+/// Intersect the given physical rect with the current clipping rect and set
+/// as the new clipping rect.
+///
+/// Returns the previous clipping rect, use clipSet to restore it.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn clip(new: Rect.Physical) Rect.Physical {
+    const cw = currentWindow();
+    const ret = cw.clipRect;
+    clipSet(cw.clipRect.intersect(new));
+    return ret;
+}
+
+/// Set the current clipping rect to the given physical rect.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn clipSet(r: Rect.Physical) void {
+    currentWindow().clipRect = r;
+}
+
+/// Get the Widget that would be the parent of a new widget.
+///
+/// ```zig
+/// dvui.parentGet().extendId(@src(), id_extra)
+/// ```
+/// is how new widgets get their id, and can be used to make a unique id without
+/// making a widget.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn parentGet() Widget {
+    return currentWindow().data().parent;
+}
+
+/// Make w the new parent widget.  See `parentGet`.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn parentSet(w: Widget) void {
+    const cw = currentWindow();
+    cw.data().parent = w;
+}
+
+/// Make a previous parent widget the current parent.
+///
+/// Pass the current parent's id.  This is used to detect a coding error where
+/// a widget's `.deinit()` was accidentally not called.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn parentReset(id: WidgetId, w: Widget) void {
+    const cw = currentWindow();
+    const actual_current = cw.data().parent.data().id;
+    if (id != actual_current) {
+        cw.debug.widget_id = actual_current;
+
+        var wd = cw.data().parent.data();
+
+        log.err("widget is not closed within its parent. did you forget to call `.deinit()`?", .{});
+
+        while (true) : (wd = wd.parent.data()) {
+            log.err("  {s}:{d} {s} {x}{s}", .{
+                wd.src.file,
+                wd.src.line,
+                wd.options.name orelse "???",
+                wd.id,
+                if (wd.id == cw.data().id) "\n" else "",
+            });
+
+            if (wd.id == cw.data().id) {
+                // got to base Window
+                break;
+            }
+        }
+    }
+    cw.data().parent = w;
+}
+
+/// Get the OS window size in natural pixels.  Physical pixels might be more on
+/// a hidpi screen or if the user has content scaling.  See `windowRectPixels`.
+///
+/// Natural pixels is the unit for subwindow sizing and placement.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn windowRect() Rect.Natural {
+    // Window.data().rect is the definition of natural
+    return .cast(currentWindow().data().rect);
+}
+
+/// Get the OS window size in pixels.  See `windowRect`.
+///
+/// Pixels is the unit for rendering and user input.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn windowRectPixels() Rect.Physical {
+    return currentWindow().rect_pixels;
+}
+
+/// Get the Rect and scale factor for the OS window.  The Rect is in pixels,
+/// and the scale factor is how many pixels per natural pixel.  See
+/// `windowRect`.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn windowRectScale() RectScale {
+    return currentWindow().rectScale();
+}
+
+/// The natural scale is how many pixels per natural pixel.  Useful for
+/// converting between user input and subwindow size/position.  See
+/// `windowRect`.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn windowNaturalScale() f32 {
+    return currentWindow().natural_scale;
+}
+
+/// True if this is the first frame we've seen this widget id, meaning we don't
+/// know its min size yet.  The widget will record its min size in `.deinit()`.
+///
+/// If a widget is not seen for a frame, its min size will be forgotten and
+/// firstFrame will return true the next frame we see it.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn firstFrame(id: WidgetId) bool {
+    return minSizeGet(id) == null;
+}
+
+/// Get the min size recorded for id from last frame or null if id was not seen
+/// last frame.
+///
+/// Usually you want `minSize` to combine min size from last frame with a min
+/// size provided by the user code.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn minSizeGet(id: WidgetId) ?Size {
+    return currentWindow().min_sizes.get(id);
+}
+
+/// Return the maximum of min_size and the min size for id from last frame.
+///
+/// See `minSizeGet` to get only the min size from last frame.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn minSize(id: WidgetId, min_size: Size) Size {
+    var size = min_size;
+
+    // Need to take the max of both given and previous.  ScrollArea could be
+    // passed a min size Size{.w = 0, .h = 200} meaning to get the width from the
+    // previous min size.
+    if (minSizeGet(id)) |ms| {
+        size = Size.max(size, ms);
+    }
+
+    return size;
+}
+
+/// Make a unique id from `src` and `id_extra`, possibly starting with start
+/// (usually a parent widget id).  This is how the initial parent widget id is
+/// created, and also toasts and dialogs from other threads.
+///
+/// See `Widget.extendId` which calls this with the widget id as start.
+///
+/// ```zig
+/// dvui.parentGet().extendId(@src(), id_extra)
+/// ```
+/// is how new widgets get their id, and can be used to make a unique id without
+/// making a widget.
+pub fn hashSrc(start: ?WidgetId, src: std.builtin.SourceLocation, id_extra: usize) WidgetId {
+    var hash = fnv.init();
+    if (start) |s| {
+        hash.value = s.asU64();
+    }
+    hash.update(std.mem.asBytes(&src.module.ptr));
+    hash.update(std.mem.asBytes(&src.file.ptr));
+    hash.update(std.mem.asBytes(&src.line));
+    hash.update(std.mem.asBytes(&src.column));
+    hash.update(std.mem.asBytes(&id_extra));
+    return @enumFromInt(hash.final());
+}
+
+/// Make a new id by combining id with the contents of key.  This is how dvui
+/// tracks things in `dataGet`/`dataSet`, `animation`, and `timer`.
+pub fn hashIdKey(id: WidgetId, key: []const u8) u64 {
+    var h = fnv.init();
+    h.value = id.asU64();
+    h.update(key);
+    return h.final();
+}
+
+/// Set key/value pair for given id.
+///
+/// Can be called from any thread.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the `Window` you want to add the data to.
+///
+/// Stored data with the same id/key will be overwritten if it has the same size,
+/// otherwise the data will be freed at the next call to `Window.end`. This means
+/// that if a pointer to the same id/key was retrieved earlier, the value behind
+/// that pointer would be modified.
+///
+/// If you want to store the contents of a slice, use `dataSetSlice`.
+pub fn dataSet(win: ?*Window, id: WidgetId, key: []const u8, data: anytype) void {
+    dataSetAdvanced(win, id, key, data, false, 1);
+}
+
+/// Set key/value pair for given id, copying the slice contents. Can be passed
+/// a slice or pointer to an array.
+///
+/// Can be called from any thread.
+///
+/// Stored data with the same id/key will be overwritten if it has the same size,
+/// otherwise the data will be freed at the next call to `Window.end`. This means
+/// that if the slice with the same id/key was retrieved earlier, the value behind
+/// that slice would be modified.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the `Window` you want to add the data to.
+pub fn dataSetSlice(win: ?*Window, id: WidgetId, key: []const u8, data: anytype) void {
+    dataSetSliceCopies(win, id, key, data, 1);
+}
+
+/// Same as `dataSetSlice`, but will copy data `num_copies` times all concatenated
+/// into a single slice.  Useful to get dvui to allocate a specific number of
+/// entries that you want to fill in after.
+pub fn dataSetSliceCopies(win: ?*Window, id: WidgetId, key: []const u8, data: anytype, num_copies: usize) void {
+    const dt = @typeInfo(@TypeOf(data));
+    if (dt == .pointer and dt.pointer.size == .slice) {
+        if (dt.pointer.sentinel()) |s| {
+            dataSetAdvanced(win, id, key, @as([:s]dt.pointer.child, @constCast(data)), true, num_copies);
+        } else {
+            dataSetAdvanced(win, id, key, @as([]dt.pointer.child, @constCast(data)), true, num_copies);
+        }
+    } else if (dt == .pointer and dt.pointer.size == .one and @typeInfo(dt.pointer.child) == .array) {
+        const child_type = @typeInfo(dt.pointer.child);
+        if (child_type.array.sentinel()) |s| {
+            dataSetAdvanced(win, id, key, @as([:s]child_type.array.child, @constCast(data)), true, num_copies);
+        } else {
+            dataSetAdvanced(win, id, key, @as([]child_type.array.child, @constCast(data)), true, num_copies);
+        }
+    } else {
+        @compileError("dataSetSlice needs a slice or pointer to array, given " ++ @typeName(@TypeOf(data)));
+    }
+}
+
+/// Set key/value pair for given id.
+///
+/// Can be called from any thread.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the `Window` you want to add the data to.
+///
+/// Stored data with the same id/key will be freed at next `win.end()`.
+///
+/// If `copy_slice` is true, data must be a slice or pointer to array, and the
+/// contents are copied into internal storage. If false, only the slice itself
+/// (ptr and len) and stored.
+pub fn dataSetAdvanced(win: ?*Window, id: WidgetId, key: []const u8, data: anytype, comptime copy_slice: bool, num_copies: usize) void {
+    if (win) |w| {
+        // we are being called from non gui thread or outside begin()/end()
+        w.dataSetAdvanced(id, key, data, copy_slice, num_copies);
+    } else {
+        if (current_window) |cw| {
+            cw.dataSetAdvanced(id, key, data, copy_slice, num_copies);
+        } else {
+            @panic("dataSet current_window was null, pass a *Window as first parameter if calling from other thread or outside window.begin()/end()");
+        }
+    }
+}
+
+/// Retrieve the value for given key associated with id.
+///
+/// Can be called from any thread.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the `Window` you want to add the data to.
+///
+/// If you want a pointer to the stored data, use `dataGetPtr`.
+///
+/// If you want to get the contents of a stored slice, use `dataGetSlice`.
+pub fn dataGet(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type) ?T {
+    if (dataGetInternal(win, id, key, T, false)) |bytes| {
+        return @as(*T, @alignCast(@ptrCast(bytes.ptr))).*;
+    } else {
+        return null;
+    }
+}
+
+/// Retrieve the value for given key associated with id.  If no value was stored, store default and then return it.
+///
+/// Can be called from any thread.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the `Window` you want to add the data to.
+///
+/// If you want a pointer to the stored data, use `dataGetPtrDefault`.
+///
+/// If you want to get the contents of a stored slice, use `dataGetSlice`.
+pub fn dataGetDefault(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type, default: T) T {
+    if (dataGetInternal(win, id, key, T, false)) |bytes| {
+        return @as(*T, @alignCast(@ptrCast(bytes.ptr))).*;
+    } else {
+        dataSet(win, id, key, default);
+        return default;
+    }
+}
+
+/// Retrieve a pointer to the value for given key associated with id.  If no
+/// value was stored, store default and then return a pointer to the stored
+/// value.
+///
+/// Can be called from any thread.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the `Window` you want to add the data to.
+///
+/// Returns a pointer to internal storage, which will be freed after a frame
+/// where there is no call to any `dataGet`/`dataSet` functions for that id/key
+/// combination.
+///
+/// The pointer will always be valid until the next call to `Window.end`.
+///
+/// If you want to get the contents of a stored slice, use `dataGetSlice`.
+pub fn dataGetPtrDefault(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type, default: T) *T {
+    if (dataGetPtr(win, id, key, T)) |ptr| {
+        return ptr;
+    } else {
+        dataSet(win, id, key, default);
+        return dataGetPtr(win, id, key, T).?;
+    }
+}
+
+/// Retrieve a pointer to the value for given key associated with id.
+///
+/// Can be called from any thread.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the `Window` you want to add the data to.
+///
+/// Returns a pointer to internal storage, which will be freed after a frame
+/// where there is no call to any `dataGet`/`dataSet` functions for that id/key
+/// combination.
+///
+/// The pointer will always be valid until the next call to `Window.end`.
+///
+/// If you want to get the contents of a stored slice, use `dataGetSlice`.
+pub fn dataGetPtr(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type) ?*T {
+    if (dataGetInternal(win, id, key, T, false)) |bytes| {
+        return @as(*T, @alignCast(@ptrCast(bytes.ptr)));
+    } else {
+        return null;
+    }
+}
+
+/// Retrieve slice contents for given key associated with id.
+///
+/// `dataSetSlice` strips const from the slice type, so always call
+/// `dataGetSlice` with a mutable slice type ([]u8, not []const u8).
+///
+/// Can be called from any thread.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the `Window` you want to add the data to.
+///
+/// The returned slice points to internal storage, which will be freed after
+/// a frame where there is no call to any `dataGet`/`dataSet` functions for that
+/// id/key combination.
+///
+/// The slice will always be valid until the next call to `Window.end`.
+pub fn dataGetSlice(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type) ?T {
+    const dt = @typeInfo(T);
+    if (dt != .pointer or dt.pointer.size != .slice) {
+        @compileError("dataGetSlice needs a slice, given " ++ @typeName(T));
+    }
+
+    if (dataGetInternal(win, id, key, T, true)) |bytes| {
+        if (dt.pointer.sentinel()) |sentinel| {
+            return @as([:sentinel]align(@alignOf(dt.pointer.child)) dt.pointer.child, @alignCast(@ptrCast(std.mem.bytesAsSlice(dt.pointer.child, bytes[0 .. bytes.len - @sizeOf(dt.pointer.child)]))));
+        } else {
+            return @as([]align(@alignOf(dt.pointer.child)) dt.pointer.child, @alignCast(std.mem.bytesAsSlice(dt.pointer.child, bytes)));
+        }
+    } else {
+        return null;
+    }
+}
+
+/// Retrieve slice contents for given key associated with id.
+///
+/// If the id/key doesn't exist yet, store the default slice into internal
+/// storage, and then return the internal storage slice.
+///
+/// Can be called from any thread.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the `Window` you want to add the data to.
+///
+/// The returned slice points to internal storage, which will be freed after
+/// a frame where there is no call to any `dataGet`/`dataSet` functions for that
+/// id/key combination.
+///
+/// The slice will always be valid until the next call to `Window.end`.
+pub fn dataGetSliceDefault(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type, default: []const @typeInfo(T).pointer.child) T {
+    return dataGetSlice(win, id, key, T) orelse blk: {
+        dataSetSlice(win, id, key, default);
+        break :blk dataGetSlice(win, id, key, T).?;
+    };
+}
+
+// returns the backing slice of bytes if we have it
+pub fn dataGetInternal(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type, slice: bool) ?[]u8 {
+    if (win) |w| {
+        // we are being called from non gui thread or outside begin()/end()
+        return w.dataGetInternal(id, key, T, slice);
+    } else {
+        if (current_window) |cw| {
+            return cw.dataGetInternal(id, key, T, slice);
+        } else {
+            @panic("dataGet current_window was null, pass a *Window as first parameter if calling from other thread or outside window.begin()/end()");
+        }
+    }
+}
+
+/// Remove key (and data if any) for given id.  The data will be freed at next
+/// `Window.end`.
+///
+/// Can be called from any thread.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the `Window` you want to add the dialog to.
+pub fn dataRemove(win: ?*Window, id: WidgetId, key: []const u8) void {
+    if (win) |w| {
+        // we are being called from non gui thread or outside begin()/end()
+        return w.dataRemove(id, key);
+    } else {
+        if (current_window) |cw| {
+            return cw.dataRemove(id, key);
+        } else {
+            @panic("dataRemove current_window was null, pass a *Window as first parameter if calling from other thread or outside window.begin()/end()");
+        }
+    }
+}
+
+/// Return a rect that fits inside avail given the options. avail wins over
+/// `min_size`.
+pub fn placeIn(avail: Rect, min_size: Size, e: Options.Expand, g: Options.Gravity) Rect {
+    var size = min_size;
+
+    // you never get larger than available
+    size.w = @min(size.w, avail.w);
+    size.h = @min(size.h, avail.h);
+
+    switch (e) {
+        .none => {},
+        .horizontal => {
+            size.w = avail.w;
+        },
+        .vertical => {
+            size.h = avail.h;
+        },
+        .both => {
+            size = avail.size();
+        },
+        .ratio => {
+            if (min_size.w > 0 and min_size.h > 0 and avail.w > 0 and avail.h > 0) {
+                const ratio = min_size.w / min_size.h;
+                if (min_size.w > avail.w or min_size.h > avail.h) {
+                    // contracting
+                    const wratio = avail.w / min_size.w;
+                    const hratio = avail.h / min_size.h;
+                    if (wratio < hratio) {
+                        // width is constraint
+                        size.w = avail.w;
+                        size.h = @min(avail.h, wratio * min_size.h);
+                    } else {
+                        // height is constraint
+                        size.h = avail.h;
+                        size.w = @min(avail.w, hratio * min_size.w);
+                    }
+                } else {
+                    // expanding
+                    const aratio = (avail.w - size.w) / (avail.h - size.h);
+                    if (aratio > ratio) {
+                        // height is constraint
+                        size.w = @min(avail.w, avail.h * ratio);
+                        size.h = avail.h;
+                    } else {
+                        // width is constraint
+                        size.w = avail.w;
+                        size.h = @min(avail.h, avail.w / ratio);
+                    }
+                }
+            }
+        },
+    }
+
+    var r = avail.shrinkToSize(size);
+    r.x = avail.x + g.x * (avail.w - r.w);
+    r.y = avail.y + g.y * (avail.h - r.h);
+
+    return r;
+}
+// }}}
+
+// FPS {{{
 /// Nanosecond timestamp for this frame.
 ///
 /// Updated during `Window.begin`.  Will not go backwards.
@@ -491,6 +1124,52 @@ pub fn frameTimeNS() i128 {
     return currentWindow().frame_time_ns;
 }
 
+/// Seconds elapsed between last frame and current.  This value can be quite
+/// high after a period with no user interaction.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn secondsSinceLastFrame() f32 {
+    return currentWindow().secs_since_last_frame;
+}
+
+/// Average frames per second over the past 30 frames.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn FPS() f32 {
+    return currentWindow().FPS();
+}
+
+/// Requests another frame to be shown.
+///
+/// This only matters if you are using dvui to manage the framerate (by calling
+/// `Window.waitTime` and using the return value to wait with event
+/// interruption - for example `sdl_backend.waitEventTimeout` at the end of each
+/// frame).
+///
+/// src and id are for debugging, which is enabled by calling
+/// `Window.debugRefresh(true)`.  The debug window has a toggle button for this.
+///
+/// Can be called from any thread.
+///
+/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
+/// pass a pointer to the Window you want to refresh.  In that case dvui will
+/// go through the backend because the gui thread might be waiting.
+pub fn refresh(win: ?*Window, src: std.builtin.SourceLocation, id: ?WidgetId) void {
+    if (win) |w| {
+        // we are being called from non gui thread, the gui thread might be
+        // sleeping, so need to trigger a wakeup via the backend
+        w.refreshBackend(src, id);
+    } else {
+        if (current_window) |cw| {
+            cw.refreshWindow(src, id);
+        } else {
+            log.err("{s}:{d} refresh current_window was null, pass a *Window as first parameter if calling from other thread or outside window.begin()/end()", .{ src.file, src.line });
+        }
+    }
+}
+// }}}
+
+// Font {{{
 /// The bytes of a truetype font file and whether to free it.
 pub const FontBytesEntry = struct {
     ttf_bytes: []const u8,
@@ -1080,6 +1759,59 @@ pub fn fontCacheInit(ttf_bytes: []const u8, font: Font) FontError!FontCacheEntry
     }
 }
 
+pub fn debugFontAtlases(src: std.builtin.SourceLocation, opts: Options) void {
+    const cw = currentWindow();
+
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var it = cw.font_cache.iterator();
+    while (it.next()) |kv| {
+        const texture_atlas = kv.value_ptr.getTextureAtlas() catch |err| {
+            // TODO: Maybe FontCacheEntry should keep the font name for debugging? (FIX BELLOW TOO)
+            dvui.logError(@src(), err, "Could not get texture atlast with key {x} at height {d}", .{ kv.key_ptr.*, kv.value_ptr.height });
+            continue;
+        };
+        width = @max(width, texture_atlas.width);
+        height += texture_atlas.height;
+    }
+
+    const sizePhys: Size.Physical = .{ .w = @floatFromInt(width), .h = @floatFromInt(height) };
+
+    const ss = parentGet().screenRectScale(Rect{}).s;
+    const size = sizePhys.scale(1.0 / ss, Size);
+
+    var wd = WidgetData.init(src, .{}, opts.override(.{ .name = "debugFontAtlases", .min_size_content = size }));
+    wd.register();
+
+    wd.borderAndBackground(.{});
+
+    var rs = wd.parent.screenRectScale(placeIn(wd.contentRect(), size, .none, opts.gravityGet()));
+    const color = opts.color(.text);
+
+    if (cw.snap_to_pixels) {
+        rs.r.x = @round(rs.r.x);
+        rs.r.y = @round(rs.r.y);
+    }
+
+    it = cw.font_cache.iterator();
+    while (it.next()) |kv| {
+        const texture_atlas = kv.value_ptr.getTextureAtlas() catch continue;
+        rs.r = rs.r.toSize(.{
+            .w = @floatFromInt(texture_atlas.width),
+            .h = @floatFromInt(texture_atlas.height),
+        });
+        renderTexture(texture_atlas, rs, .{ .colormod = color }) catch |err| {
+            logError(@src(), err, "Could not render font atlast", .{});
+        };
+        rs.r.y += rs.r.h;
+    }
+
+    wd.minSizeSetAndRefresh();
+    wd.minSizeReportToParent();
+}
+// }}}
+
+// Texture {{{
 /// A texture held by the backend.  Can be drawn with `renderTexture`.
 pub const Texture = struct {
     ptr: *anyopaque,
@@ -1158,6 +1890,83 @@ pub const TextureTarget = struct {
     height: u32,
 };
 
+/// Create a texture that can be rendered with `renderTexture`.
+///
+/// Remember to destroy the texture at some point, see `textureDestroyLater`.
+///
+/// Only valid between `Window.begin` and `Window.end`.
+pub fn textureCreate(pixels: []const Color.PMA, width: u32, height: u32, interpolation: enums.TextureInterpolation) Backend.TextureError!Texture {
+    if (pixels.len != width * height) {
+        log.err("Texture was created with an incorrect amount of pixels, expected {d} but got {d} (w: {d}, h: {d})", .{ pixels.len, width * height, width, height });
+    }
+    return currentWindow().backend.textureCreate(@ptrCast(pixels.ptr), width, height, interpolation);
+}
+
+/// Update a texture that was created with `textureCreate`.
+///
+/// this is only valid to call while the Texture is not destroyed!
+///
+/// Only valid between `Window.begin` and `Window.end`.
+pub fn textureUpdate(Self: *Texture, pma: []const dvui.Color.PMA, interpolation: enums.TextureInterpolation) !void {
+    if (pma.len != Self.width * Self.height) @panic("Texture size and supplied Content did not match");
+    currentWindow().backend.textureUpdate(Self.*, @ptrCast(pma.ptr)) catch |err| {
+        // texture update not supported by backend, destroy and create texture
+        if (err == Backend.TextureError.NotImplemented) {
+            const new_tex = try textureCreate(pma, Self.width, Self.height, interpolation);
+            textureDestroyLater(Self.*);
+            Self.* = new_tex;
+        } else {
+            return err;
+        }
+    };
+}
+
+/// Create a texture that can be rendered with `renderTexture` and drawn to
+/// with `renderTarget`.  Starts transparent (all zero).
+///
+/// Remember to destroy the texture at some point, see `textureDestroyLater`.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn textureCreateTarget(width: u32, height: u32, interpolation: enums.TextureInterpolation) Backend.TextureError!TextureTarget {
+    return try currentWindow().backend.textureCreateTarget(width, height, interpolation);
+}
+
+/// Read pixels from texture created with `textureCreateTarget`.
+///
+/// Returns pixels allocated by arena.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn textureReadTarget(arena: std.mem.Allocator, texture: TextureTarget) Backend.TextureError![]Color.PMA {
+    const size: usize = texture.width * texture.height * @sizeOf(Color.PMA);
+    const pixels = try arena.alloc(u8, size);
+    errdefer arena.free(pixels);
+
+    try currentWindow().backend.textureReadTarget(texture, pixels.ptr);
+
+    return @ptrCast(pixels);
+}
+
+/// Convert a target texture to a normal texture.  target is destroyed.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn textureFromTarget(target: TextureTarget) Backend.TextureError!Texture {
+    return currentWindow().backend.textureFromTarget(target);
+}
+
+/// Destroy a texture created with `textureCreate` at the end of the frame.
+///
+/// While `Backend.textureDestroy` immediately destroys the texture, this
+/// function deferres the destruction until the end of the frame, so it is safe
+/// to use even in a subwindow where rendering is deferred.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn textureDestroyLater(texture: Texture) void {
+    const cw = currentWindow();
+    cw.texture_trash.append(cw.arena(), texture) catch |err| {
+        dvui.log.err("textureDestroyLater got {!}\n", .{err});
+    };
+}
+
 /// Gets a texture from the internal texture cache. If a texture
 /// isn't used for one frame it gets removed from the cache and
 /// destroyed.
@@ -1205,46 +2014,9 @@ pub fn textureInvalidateCache(key: Texture.CacheKey) void {
         dvui.textureDestroyLater(kv.value);
     }
 }
+// }}}
 
-/// Takes in svg bytes and returns a tvg bytes that can be used
-/// with `icon` or `iconTexture`
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn svgToTvg(allocator: std.mem.Allocator, svg_bytes: []const u8) (std.mem.Allocator.Error || TvgError)![]const u8 {
-    return tvg.tvg_from_svg(allocator, svg_bytes, .{}) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        else => {
-            log.debug("svgToTvg returned {!}", .{err});
-            return TvgError.tvgError;
-        },
-    };
-}
-
-/// Get the width of an icon at a specified height.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn iconWidth(name: []const u8, tvg_bytes: []const u8, height: f32) TvgError!f32 {
-    if (height == 0) return 0.0;
-    var stream = std.io.fixedBufferStream(tvg_bytes);
-    var parser = tvg.tvg.parse(currentWindow().arena(), stream.reader()) catch |err| {
-        log.warn("iconWidth Tinyvg error {!} parsing icon {s}\n", .{ err, name });
-        return TvgError.tvgError;
-    };
-    defer parser.deinit();
-
-    return height * @as(f32, @floatFromInt(parser.header.width)) / @as(f32, @floatFromInt(parser.header.height));
-}
-pub const IconRenderOptions = struct {
-    /// if null uses original fill colors, use .transparent to disable fill
-    fill_color: ?Color = .white,
-    /// if null uses original stroke width
-    stroke_width: ?f32 = null,
-    /// if null uses original stroke colors
-    stroke_color: ?Color = .white,
-
-    // note: IconWidget tests against default values
-};
-
+// Rendering {{{
 /// Represents a deferred call to one of the render functions.  This is how
 /// dvui defers rendering of floating windows so they render on top of widgets
 /// that run later in the frame.
@@ -1273,178 +2045,424 @@ pub const RenderCommand = struct {
     },
 };
 
-/// Id of the currently focused subwindow.  Used by `FloatingMenuWidget` to
-/// detect when to stop showing.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn focusedSubwindowId() WidgetId {
+pub fn renderTriangles(triangles: Triangles, tex: ?Texture) Backend.GenericError!void {
+    if (triangles.vertexes.len == 0) {
+        return;
+    }
+
+    if (dvui.clipGet().empty()) {
+        return;
+    }
+
     const cw = currentWindow();
-    const sw = cw.subwindowFocused();
-    return sw.id;
+
+    if (!cw.render_target.rendering) {
+        const tri_copy = try triangles.dupe(cw.arena());
+        const cmd = RenderCommand{ .snap = cw.snap_to_pixels, .clip = clipGet(), .cmd = .{ .triangles = .{ .tri = tri_copy, .tex = tex } } };
+
+        var sw = cw.subwindowCurrent();
+        try sw.render_cmds.append(cw.arena(), cmd);
+        return;
+    }
+
+    const clipr: ?Rect.Physical = if (triangles.bounds.clippedBy(clipGet())) clipGet().offsetNegPoint(cw.render_target.offset) else null;
+
+    if (cw.render_target.offset.nonZero()) {
+        const offset = cw.render_target.offset;
+        for (triangles.vertexes) |*v| {
+            v.pos = v.pos.diff(offset);
+        }
+    }
+
+    try cw.backend.drawClippedTriangles(tex, triangles.vertexes, triangles.indices, clipr);
 }
 
-/// Focus a subwindow.
-///
-/// If you are doing this in response to an `Event`, you can pass that `Event`'s
-/// "num" to change the focus of any further `Event`s in the list.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn focusSubwindow(subwindow_id: ?WidgetId, event_num: ?u16) void {
-    currentWindow().focusSubwindowInternal(subwindow_id, event_num);
-}
+pub const renderTextOptions = struct {
+    font: Font,
+    text: []const u8,
+    rs: RectScale,
+    color: Color,
+    sel_start: ?usize = null,
+    sel_end: ?usize = null,
+    sel_color: ?Color = null,
+    sel_color_bg: ?Color = null,
+    debug: bool = false,
+};
 
-/// Raise a subwindow to the top of the stack.
-///
-/// Any subwindows directly above it with "stay_above_parent_window" set will also be moved to stay above it.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn raiseSubwindow(subwindow_id: WidgetId) void {
-    const cw = currentWindow();
-    // don't check against subwindows[0] - that's that main window
-    var items = cw.subwindows.items[1..];
-    for (items, 0..) |sw, i| {
-        if (sw.id == subwindow_id) {
-            if (sw.stay_above_parent_window != null) {
-                //std.debug.print("raiseSubwindow: tried to raise a subwindow {x} with stay_above_parent_window set\n", .{subwindow_id});
-                return;
-            }
+// only renders a single line of text
+pub fn renderText(opts: renderTextOptions) Backend.GenericError!void {
+    if (opts.rs.s == 0) return;
+    if (opts.text.len == 0) return;
+    if (clipGet().intersect(opts.rs.r).empty()) return;
 
-            if (i == (items.len - 1)) {
-                // already on top
-                return;
-            }
+    var cw = currentWindow();
+    const utf8_text = try toUtf8(cw.lifo(), opts.text);
+    defer if (opts.text.ptr != utf8_text.ptr) cw.lifo().free(utf8_text);
 
-            // move it to the end, also move any stay_above_parent_window subwindows
-            // directly on top of it as well - we know from above that the
-            // first window does not have stay_above_parent_window so this loop ends
-            var first = true;
-            while (first or items[i].stay_above_parent_window != null) {
-                first = false;
-                const item = items[i];
-                for (items[i..(items.len - 1)], 0..) |*b, k| {
-                    b.* = items[i + 1 + k];
-                }
-                items[items.len - 1] = item;
-            }
+    if (!cw.render_target.rendering) {
+        var opts_copy = opts;
+        opts_copy.text = try cw.arena().dupe(u8, utf8_text);
+        const cmd = RenderCommand{ .snap = cw.snap_to_pixels, .clip = clipGet(), .cmd = .{ .text = opts_copy } };
 
+        var sw = cw.subwindowCurrent();
+        try sw.render_cmds.append(cw.arena(), cmd);
+        return;
+    }
+
+    const target_size = opts.font.size * opts.rs.s;
+    const sized_font = opts.font.resize(target_size);
+
+    // might get a slightly smaller font
+    var fce = try fontCacheGet(sized_font);
+
+    // this must be synced with Font.textSizeEx()
+    const target_fraction = if (cw.snap_to_pixels) 1.0 else target_size / fce.height;
+
+    // make sure the cache has all the glyphs we need
+    var utf8it = std.unicode.Utf8View.initUnchecked(utf8_text).iterator();
+    while (utf8it.nextCodepoint()) |codepoint| {
+        _ = try fce.glyphInfoGetOrReplacement(@as(u32, @intCast(codepoint)), opts.font.name);
+    }
+
+    // Generate new texture atlas if needed to update glyph uv coords
+    const texture_atlas = fce.getTextureAtlas() catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => {
+            log.err("Could not get texture atlas for font {s}, text area marked in magenta, to display '{s}'", .{ opts.font.name, opts.text });
+            opts.rs.r.fill(.{}, .{ .color = .magenta });
             return;
-        }
+        },
+    };
+
+    // Over allocate the internal buffers assuming each byte is a character
+    var builder = try Triangles.Builder.init(cw.lifo(), 4 * utf8_text.len, 6 * utf8_text.len);
+    defer builder.deinit(cw.lifo());
+
+    const x_start: f32 = if (cw.snap_to_pixels) @round(opts.rs.r.x) else opts.rs.r.x;
+    var x = x_start;
+    var max_x = x_start;
+    const y: f32 = if (cw.snap_to_pixels) @round(opts.rs.r.y) else opts.rs.r.y;
+
+    if (opts.debug) {
+        log.debug("renderText x {d} y {d}\n", .{ x, y });
     }
 
-    log.warn("raiseSubwindow couldn't find subwindow {x}\n", .{subwindow_id});
-    return;
-}
+    var sel_in: bool = false;
+    var sel_start_x: f32 = x;
+    var sel_end_x: f32 = x;
+    var sel_max_y: f32 = y;
+    var sel_start: usize = opts.sel_start orelse 0;
+    sel_start = @min(sel_start, utf8_text.len);
+    var sel_end: usize = opts.sel_end orelse 0;
+    sel_end = @min(sel_end, utf8_text.len);
+    // if we will definitely have a selected region or not
+    const sel: bool = sel_start < sel_end;
 
-/// Focus a widget in the given subwindow (if null, the current subwindow).
-///
-/// If you are doing this in response to an `Event`, you can pass that `Event`'s
-/// num to change the focus of any further `Event`s in the list.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn focusWidget(id: ?WidgetId, subwindow_id: ?WidgetId, event_num: ?u16) void {
-    const cw = currentWindow();
-    cw.scroll_to_focused = false;
-    const swid = subwindow_id orelse subwindowCurrentId();
-    for (cw.subwindows.items) |*sw| {
-        if (swid == sw.id) {
-            if (sw.focused_widgetId != id) {
-                sw.focused_widgetId = id;
-                if (event_num) |en| {
-                    cw.focusEventsInternal(en, sw.id, sw.focused_widgetId);
-                }
-                refresh(null, @src(), null);
+    const atlas_size: Size = .{ .w = @floatFromInt(texture_atlas.width), .h = @floatFromInt(texture_atlas.height) };
 
-                if (id) |wid| {
-                    cw.scroll_to_focused = true;
+    var bytes_seen: usize = 0;
+    utf8it = std.unicode.Utf8View.initUnchecked(utf8_text).iterator();
+    var last_codepoint: u32 = 0;
+    var last_glyph_index: u32 = 0;
+    while (utf8it.nextCodepoint()) |codepoint| {
+        const gi = try fce.glyphInfoGetOrReplacement(@as(u32, @intCast(codepoint)), opts.font.name);
 
-                    if (cw.last_registered_id_this_frame == wid) {
-                        cw.last_focused_id_this_frame = wid;
-                    } else {
-                        // walk parent chain
-                        var wd = cw.data().parent.data();
+        // kerning
+        if (last_codepoint != 0) {
+            if (useFreeType) {
+                if (last_glyph_index == 0) last_glyph_index = c.FT_Get_Char_Index(fce.face, last_codepoint);
+                const glyph_index: u32 = c.FT_Get_Char_Index(fce.face, codepoint);
+                var kern: c.FT_Vector = undefined;
+                FontCacheEntry.intToError(c.FT_Get_Kerning(fce.face, last_glyph_index, glyph_index, c.FT_KERNING_DEFAULT, &kern)) catch |err| {
+                    log.warn("renderText freetype error {!} trying to FT_Get_Kerning font {s} codepoints {d} {d}\n", .{ err, opts.font.name, last_codepoint, codepoint });
+                    // Set fallback kern and continue to the best of out ability
+                    kern.x = 0;
+                    kern.y = 0;
+                    // return FontError.fontError;
+                };
+                last_glyph_index = glyph_index;
 
-                        while (true) : (wd = wd.parent.data()) {
-                            if (wd.id == wid) {
-                                cw.last_focused_id_this_frame = wid;
-                                break;
-                            }
+                const kern_x: f32 = @as(f32, @floatFromInt(kern.x)) / 64.0;
 
-                            if (wd.id == cw.data().id) {
-                                // got to base Window
-                                break;
-                            }
-                        }
-                    }
-                }
+                x += kern_x;
+            } else {
+                const kern_adv: c_int = c.stbtt_GetCodepointKernAdvance(&fce.face, @as(c_int, @intCast(last_codepoint)), @as(c_int, @intCast(codepoint)));
+                const kern_x = fce.scaleFactor * @as(f32, @floatFromInt(kern_adv));
+
+                x += kern_x;
             }
-            break;
+        }
+        last_codepoint = codepoint;
+
+        const nextx = x + gi.advance * target_fraction;
+
+        if (sel) {
+            bytes_seen += std.unicode.utf8CodepointSequenceLength(codepoint) catch unreachable;
+            if (!sel_in and bytes_seen > sel_start and bytes_seen <= sel_end) {
+                // entering selection
+                sel_in = true;
+                sel_start_x = x;
+            } else if (sel_in and bytes_seen > sel_end) {
+                // leaving selection
+                sel_in = false;
+            }
+
+            if (sel_in) {
+                // update selection
+                sel_end_x = nextx;
+            }
+        }
+
+        // don't output triangles for a zero-width glyph (space seems to be the only one)
+        if (gi.w > 0) {
+            const vtx_offset: u16 = @intCast(builder.vertexes.items.len);
+            var v: Vertex = undefined;
+
+            v.pos.x = x + gi.leftBearing * target_fraction;
+            v.pos.y = y + gi.topBearing * target_fraction;
+            v.col = .fromColor(if (sel_in) opts.sel_color orelse opts.color else opts.color);
+            v.uv = gi.uv;
+            builder.appendVertex(v);
+
+            if (opts.debug) {
+                log.debug(" - x {d} y {d}", .{ v.pos.x, v.pos.y });
+            }
+
+            if (opts.debug) {
+                //log.debug("{d} pad {d} minx {d} maxx {d} miny {d} maxy {d} x {d} y {d}", .{ bytes_seen, pad, gi.minx, gi.maxx, gi.miny, gi.maxy, v.pos.x, v.pos.y });
+                //log.debug("{d} pad {d} left {d} top {d} w {d} h {d} advance {d}", .{ bytes_seen, pad, gi.f2_leftBearing, gi.f2_topBearing, gi.f2_w, gi.f2_h, gi.f2_advance });
+            }
+
+            v.pos.x = x + (gi.leftBearing + gi.w) * target_fraction;
+            max_x = v.pos.x;
+            v.uv[0] = gi.uv[0] + gi.w / atlas_size.w;
+            builder.appendVertex(v);
+
+            v.pos.y = y + (gi.topBearing + gi.h) * target_fraction;
+            sel_max_y = @max(sel_max_y, v.pos.y);
+            v.uv[1] = gi.uv[1] + gi.h / atlas_size.h;
+            builder.appendVertex(v);
+
+            v.pos.x = x + gi.leftBearing * target_fraction;
+            v.uv[0] = gi.uv[0];
+            builder.appendVertex(v);
+
+            // triangles must be counter-clockwise (y going down) to avoid backface culling
+            builder.appendTriangles(&.{
+                vtx_offset + 0, vtx_offset + 2, vtx_offset + 1,
+                vtx_offset + 0, vtx_offset + 3, vtx_offset + 2,
+            });
+        }
+
+        x = nextx;
+    }
+
+    if (sel) {
+        if (opts.sel_color_bg) |bgcol| {
+            Rect.Physical.fromPoint(.{ .x = sel_start_x, .y = opts.rs.r.y })
+                .toPoint(.{
+                    .x = sel_end_x,
+                    .y = @max(sel_max_y, opts.rs.r.y + fce.height * target_fraction * opts.font.line_height_factor),
+                })
+                .fill(.{}, .{ .color = bgcol, .blur = 0 });
         }
     }
+
+    try renderTriangles(builder.build_unowned(), texture_atlas);
 }
 
-/// Id of the focused widget (if any) in the focused subwindow.
+pub const RenderTarget = struct {
+    texture: ?TextureTarget,
+    offset: Point.Physical,
+    rendering: bool = true,
+};
+
+/// Change where dvui renders.  Can pass output from `textureCreateTarget` or
+/// null for the screen.  Returns the previous target/offset.
+///
+/// offset will be subtracted from all dvui rendering, useful as the point on
+/// the screen the texture will map to.
+///
+/// Useful for caching expensive renders or to save a render for export.  See
+/// `Picture`.
 ///
 /// Only valid between `Window.begin`and `Window.end`.
-pub fn focusedWidgetId() ?WidgetId {
+pub fn renderTarget(args: RenderTarget) RenderTarget {
+    var cw = currentWindow();
+    const ret = cw.render_target;
+    cw.backend.renderTarget(args.texture) catch |err| {
+        // TODO: This might be unrecoverable? Or brake rendering too badly?
+        logError(@src(), err, "Failed to set render target", .{});
+        return ret;
+    };
+    cw.render_target = args;
+    return ret;
+}
+
+pub const RenderTextureOptions = struct {
+    rotation: f32 = 0,
+    colormod: Color = .{},
+    corner_radius: Rect = .{},
+    uv: Rect = .{ .w = 1, .h = 1 },
+    background_color: ?Color = null,
+    debug: bool = false,
+};
+
+pub fn renderTexture(tex: Texture, rs: RectScale, opts: RenderTextureOptions) Backend.GenericError!void {
+    if (rs.s == 0) return;
+    if (clipGet().intersect(rs.r).empty()) return;
+
+    var cw = currentWindow();
+
+    if (!cw.render_target.rendering) {
+        const cmd = RenderCommand{ .snap = cw.snap_to_pixels, .clip = clipGet(), .cmd = .{ .texture = .{ .tex = tex, .rs = rs, .opts = opts } } };
+
+        var sw = cw.subwindowCurrent();
+        try sw.render_cmds.append(cw.arena(), cmd);
+        return;
+    }
+
+    var path: Path.Builder = .init(dvui.currentWindow().lifo());
+    defer path.deinit();
+
+    path.addRect(rs.r, opts.corner_radius.scale(rs.s, Rect.Physical));
+
+    var triangles = try path.build().fillConvexTriangles(cw.lifo(), .{ .color = opts.colormod });
+    defer triangles.deinit(cw.lifo());
+
+    triangles.uvFromRectuv(rs.r, opts.uv);
+    triangles.rotate(rs.r.center(), opts.rotation);
+
+    if (opts.background_color) |bg_col| {
+        var back_tri = try triangles.dupe(cw.lifo());
+        defer back_tri.deinit(cw.lifo());
+
+        back_tri.color(bg_col);
+        try renderTriangles(back_tri, null);
+    }
+
+    try renderTriangles(triangles, tex);
+}
+
+pub const IconRenderOptions = struct {
+    /// if null uses original fill colors, use .transparent to disable fill
+    fill_color: ?Color = .white,
+    /// if null uses original stroke width
+    stroke_width: ?f32 = null,
+    /// if null uses original stroke colors
+    stroke_color: ?Color = .white,
+
+    // note: IconWidget tests against default values
+};
+
+pub fn renderIcon(name: []const u8, tvg_bytes: []const u8, rs: RectScale, opts: RenderTextureOptions, icon_opts: IconRenderOptions) Backend.GenericError!void {
+    if (rs.s == 0) return;
+    if (clipGet().intersect(rs.r).empty()) return;
+
+    // Ask for an integer size icon, then render it to fit rs
+    const target_size = rs.r.h;
+    const ask_height = @ceil(target_size);
+
+    var h = fnv.init();
+    h.update(std.mem.asBytes(&tvg_bytes.ptr));
+    h.update(std.mem.asBytes(&ask_height));
+    h.update(std.mem.asBytes(&icon_opts));
+    const hash = h.final();
+
+    const texture = textureGetCached(hash) orelse blk: {
+        const texture = Texture.fromTvgFile(name, tvg_bytes, @intFromFloat(ask_height), icon_opts) catch |err| {
+            logError(@src(), err, "Could not create texture from tvg file \"{s}\"", .{name});
+            return;
+        };
+        textureAddToCache(hash, texture);
+        break :blk texture;
+    };
+
+    try renderTexture(texture, rs, opts);
+}
+
+pub fn renderImage(source: ImageSource, rs: RectScale, opts: RenderTextureOptions) (Backend.TextureError || StbImageError)!void {
+    if (rs.s == 0) return;
+    if (clipGet().intersect(rs.r).empty()) return;
+    try renderTexture(try source.getTexture(), rs, opts);
+}
+
+/// Set if dvui should immediately render, and return the previous setting.
+///
+/// If false, the render functions defer until `Window.end`.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn renderingSet(r: bool) bool {
     const cw = currentWindow();
-    for (cw.subwindows.items) |*sw| {
-        if (cw.focused_subwindowId == sw.id) {
-            return sw.focused_widgetId;
+    const ret = cw.render_target.rendering;
+    cw.render_target.rendering = r;
+    return ret;
+}
+// }}}
+
+/// Captures dvui drawing to part of the screen in a `Texture`.
+pub const Picture = struct {
+    r: Rect.Physical, // pixels captured
+    texture: dvui.TextureTarget,
+    target: dvui.RenderTarget,
+
+    /// Begin recording drawing to the physical pixels in rect (enlarged to pixel boundaries).
+    ///
+    /// Returns null in case of failure (e.g. if backend does not support texture targets, if the passed rect is empty ...).
+    ///
+    /// Only valid between `Window.begin`and `Window.end`.
+    pub fn start(rect: Rect.Physical) ?Picture {
+        if (rect.empty()) {
+            log.err("Picture.start() was called with an empty rect", .{});
+            return null;
         }
+
+        var r = rect;
+        // enlarge texture to pixels boundaries
+        const x_start = @floor(r.x);
+        const x_end = @ceil(r.x + r.w);
+        r.x = x_start;
+        r.w = @round(x_end - x_start);
+
+        const y_start = @floor(r.y);
+        const y_end = @ceil(r.y + r.h);
+        r.y = y_start;
+        r.h = @round(y_end - y_start);
+
+        const texture = dvui.textureCreateTarget(@intFromFloat(r.w), @intFromFloat(r.h), .linear) catch return null;
+        const target = dvui.renderTarget(.{ .texture = texture, .offset = r.topLeft() });
+
+        return .{
+            .r = r,
+            .texture = texture,
+            .target = target,
+        };
     }
 
-    return null;
-}
-
-/// Id of the focused widget (if any) in the current subwindow.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn focusedWidgetIdInCurrentSubwindow() ?WidgetId {
-    const cw = currentWindow();
-    const sw = cw.subwindowCurrent();
-    return sw.focused_widgetId;
-}
-
-/// Last widget id we saw this frame that was the focused widget.
-///
-/// Pass result to `lastFocusedIdInFrameSince` to know if any widget was focused
-/// between the two calls.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn lastFocusedIdInFrame() WidgetId {
-    return currentWindow().last_focused_id_this_frame;
-}
-
-/// Pass result from `lastFocusedIdInFrame`.  Returns the id of a widget that
-/// was focused between the two calls, if any.
-///
-/// If so, this means one of:
-/// * a widget had focus when it called `WidgetData.register`
-/// * `focusWidget` with the id of the last widget to call `WidgetData.register`
-/// * `focusWidget` with the id of a widget in the parent chain
-///
-/// If return is non null, can pass to `eventMatch` .focus_id to match key
-/// events the focused widget got but didn't handle.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn lastFocusedIdInFrameSince(prev: WidgetId) ?WidgetId {
-    const last_focused_id = lastFocusedIdInFrame();
-    if (prev != last_focused_id) {
-        return last_focused_id;
-    } else {
-        return null;
+    /// Stop recording.
+    pub fn stop(self: *Picture) void {
+        _ = dvui.renderTarget(self.target);
     }
-}
 
-/// Set cursor the app should use if not already set this frame.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn cursorSet(cursor: enums.Cursor) void {
-    const cw = currentWindow();
-    if (cw.cursor_requested == null) {
-        cw.cursor_requested = cursor;
+    /// Encode texture as png.  Call after `stop` before `deinit`.
+    pub fn png(self: *Picture, allocator: std.mem.Allocator) Backend.TextureError![]u8 {
+        const pma_pixels = try dvui.textureReadTarget(allocator, self.texture);
+        const pixels = Color.PMA.sliceToRGBA(pma_pixels);
+        defer allocator.free(pixels);
+
+        return try dvui.pngEncode(allocator, pixels, self.texture.width, self.texture.height, .{});
     }
-}
+
+    /// Draw recorded texture and destroy it.
+    pub fn deinit(self: *Picture) void {
+        widgetFree(self);
+        // Ignore errors as drawing is not critical to Pictures function
+        const texture = dvui.textureFromTarget(self.texture) catch return; // destroys self.texture
+        dvui.textureDestroyLater(texture);
+        dvui.renderTexture(texture, .{ .r = self.r }, .{}) catch {};
+        self.* = undefined;
+    }
+};
 
 /// A collection of points that make up a shape that can later be rendered to the screen.
 ///
@@ -2187,38 +3205,172 @@ pub const Triangles = struct {
     }
 };
 
-pub fn renderTriangles(triangles: Triangles, tex: ?Texture) Backend.GenericError!void {
-    if (triangles.vertexes.len == 0) {
-        return;
-    }
-
-    if (dvui.clipGet().empty()) {
-        return;
-    }
-
+// Focus & Raising {{{
+/// Id of the currently focused subwindow.  Used by `FloatingMenuWidget` to
+/// detect when to stop showing.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn focusedSubwindowId() WidgetId {
     const cw = currentWindow();
+    const sw = cw.subwindowFocused();
+    return sw.id;
+}
 
-    if (!cw.render_target.rendering) {
-        const tri_copy = try triangles.dupe(cw.arena());
-        const cmd = RenderCommand{ .snap = cw.snap_to_pixels, .clip = clipGet(), .cmd = .{ .triangles = .{ .tri = tri_copy, .tex = tex } } };
+/// Focus a subwindow.
+///
+/// If you are doing this in response to an `Event`, you can pass that `Event`'s
+/// "num" to change the focus of any further `Event`s in the list.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn focusSubwindow(subwindow_id: ?WidgetId, event_num: ?u16) void {
+    currentWindow().focusSubwindowInternal(subwindow_id, event_num);
+}
 
-        var sw = cw.subwindowCurrent();
-        try sw.render_cmds.append(cw.arena(), cmd);
-        return;
-    }
+/// Raise a subwindow to the top of the stack.
+///
+/// Any subwindows directly above it with "stay_above_parent_window" set will also be moved to stay above it.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn raiseSubwindow(subwindow_id: WidgetId) void {
+    const cw = currentWindow();
+    // don't check against subwindows[0] - that's that main window
+    var items = cw.subwindows.items[1..];
+    for (items, 0..) |sw, i| {
+        if (sw.id == subwindow_id) {
+            if (sw.stay_above_parent_window != null) {
+                //std.debug.print("raiseSubwindow: tried to raise a subwindow {x} with stay_above_parent_window set\n", .{subwindow_id});
+                return;
+            }
 
-    const clipr: ?Rect.Physical = if (triangles.bounds.clippedBy(clipGet())) clipGet().offsetNegPoint(cw.render_target.offset) else null;
+            if (i == (items.len - 1)) {
+                // already on top
+                return;
+            }
 
-    if (cw.render_target.offset.nonZero()) {
-        const offset = cw.render_target.offset;
-        for (triangles.vertexes) |*v| {
-            v.pos = v.pos.diff(offset);
+            // move it to the end, also move any stay_above_parent_window subwindows
+            // directly on top of it as well - we know from above that the
+            // first window does not have stay_above_parent_window so this loop ends
+            var first = true;
+            while (first or items[i].stay_above_parent_window != null) {
+                first = false;
+                const item = items[i];
+                for (items[i..(items.len - 1)], 0..) |*b, k| {
+                    b.* = items[i + 1 + k];
+                }
+                items[items.len - 1] = item;
+            }
+
+            return;
         }
     }
 
-    try cw.backend.drawClippedTriangles(tex, triangles.vertexes, triangles.indices, clipr);
+    log.warn("raiseSubwindow couldn't find subwindow {x}\n", .{subwindow_id});
+    return;
 }
 
+/// Focus a widget in the given subwindow (if null, the current subwindow).
+///
+/// If you are doing this in response to an `Event`, you can pass that `Event`'s
+/// num to change the focus of any further `Event`s in the list.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn focusWidget(id: ?WidgetId, subwindow_id: ?WidgetId, event_num: ?u16) void {
+    const cw = currentWindow();
+    cw.scroll_to_focused = false;
+    const swid = subwindow_id orelse subwindowCurrentId();
+    for (cw.subwindows.items) |*sw| {
+        if (swid == sw.id) {
+            if (sw.focused_widgetId != id) {
+                sw.focused_widgetId = id;
+                if (event_num) |en| {
+                    cw.focusEventsInternal(en, sw.id, sw.focused_widgetId);
+                }
+                refresh(null, @src(), null);
+
+                if (id) |wid| {
+                    cw.scroll_to_focused = true;
+
+                    if (cw.last_registered_id_this_frame == wid) {
+                        cw.last_focused_id_this_frame = wid;
+                    } else {
+                        // walk parent chain
+                        var wd = cw.data().parent.data();
+
+                        while (true) : (wd = wd.parent.data()) {
+                            if (wd.id == wid) {
+                                cw.last_focused_id_this_frame = wid;
+                                break;
+                            }
+
+                            if (wd.id == cw.data().id) {
+                                // got to base Window
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+}
+
+/// Id of the focused widget (if any) in the focused subwindow.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn focusedWidgetId() ?WidgetId {
+    const cw = currentWindow();
+    for (cw.subwindows.items) |*sw| {
+        if (cw.focused_subwindowId == sw.id) {
+            return sw.focused_widgetId;
+        }
+    }
+
+    return null;
+}
+
+/// Id of the focused widget (if any) in the current subwindow.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn focusedWidgetIdInCurrentSubwindow() ?WidgetId {
+    const cw = currentWindow();
+    const sw = cw.subwindowCurrent();
+    return sw.focused_widgetId;
+}
+
+/// Last widget id we saw this frame that was the focused widget.
+///
+/// Pass result to `lastFocusedIdInFrameSince` to know if any widget was focused
+/// between the two calls.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn lastFocusedIdInFrame() WidgetId {
+    return currentWindow().last_focused_id_this_frame;
+}
+
+/// Pass result from `lastFocusedIdInFrame`.  Returns the id of a widget that
+/// was focused between the two calls, if any.
+///
+/// If so, this means one of:
+/// * a widget had focus when it called `WidgetData.register`
+/// * `focusWidget` with the id of the last widget to call `WidgetData.register`
+/// * `focusWidget` with the id of a widget in the parent chain
+///
+/// If return is non null, can pass to `eventMatch` .focus_id to match key
+/// events the focused widget got but didn't handle.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn lastFocusedIdInFrameSince(prev: WidgetId) ?WidgetId {
+    const last_focused_id = lastFocusedIdInFrame();
+    if (prev != last_focused_id) {
+        return last_focused_id;
+    } else {
+        return null;
+    }
+}
+// }}}
+
+// Subwindows {{{
 /// Called by floating widgets to participate in subwindow stacking - the order
 /// in which multiple subwindows are drawn and which subwindow mouse events are
 /// tagged with.
@@ -2307,121 +3459,7 @@ pub fn subwindowCurrentId() WidgetId {
     const cw = currentWindow();
     return cw.subwindow_currentId;
 }
-
-/// Optional features you might want when doing a mouse/touch drag.
-pub const DragStartOptions = struct {
-    /// Use this cursor from when a drag starts to when it ends.
-    cursor: ?enums.Cursor = null,
-
-    /// Offset of point of interest from the mouse.  Useful during a drag to
-    /// locate where to move the point of interest.
-    offset: Point.Physical = .{},
-
-    /// Used for cross-widget dragging.  See `draggingName`.
-    name: []const u8 = "",
-};
-
-/// Prepare for a possible mouse drag.  This will detect a drag, and also a
-/// normal click (mouse down and up without a drag).
-///
-/// * `dragging` will return a Point once mouse motion has moved at least 3
-/// natural pixels away from p.
-///
-/// * if cursor is non-null and a drag starts, use that cursor while dragging
-///
-/// * offset given here can be retrieved later with `dragOffset` - example is
-/// dragging bottom right corner of floating window.  The drag can start
-/// anywhere in the hit area (passing the offset to the true corner), then
-/// during the drag, the `dragOffset` is added to the current mouse location to
-/// recover where to move the true corner.
-///
-/// See `dragStart` to immediately start a drag.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn dragPreStart(p: Point.Physical, options: DragStartOptions) void {
-    const cw = currentWindow();
-    cw.drag_state = .prestart;
-    cw.drag_pt = p;
-    cw.drag_offset = options.offset;
-    cw.cursor_dragging = options.cursor;
-    cw.drag_name = options.name;
-}
-
-/// Start a mouse drag from p.  Use when only dragging is possible (normal
-/// click would do nothing), otherwise use `dragPreStart`.
-///
-/// * if cursor is non-null, use that cursor while dragging
-///
-/// * offset given here can be retrieved later with `dragOffset` - example is
-/// dragging bottom right corner of floating window.  The drag can start
-/// anywhere in the hit area (passing the offset to the true corner), then
-/// during the drag, the `dragOffset` is added to the current mouse location to
-/// recover where to move the true corner.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn dragStart(p: Point.Physical, options: DragStartOptions) void {
-    const cw = currentWindow();
-    cw.drag_state = .dragging;
-    cw.drag_pt = p;
-    cw.drag_offset = options.offset;
-    cw.cursor_dragging = options.cursor;
-    cw.drag_name = options.name;
-}
-
-/// Get offset previously given to `dragPreStart` or `dragStart`.  See those.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn dragOffset() Point.Physical {
-    const cw = currentWindow();
-    return cw.drag_offset;
-}
-
-/// If a mouse drag is happening, return the pixel difference to p from the
-/// previous dragging call or the drag starting location (from `dragPreStart`
-/// or `dragStart`).  Otherwise return null, meaning a drag hasn't started yet.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn dragging(p: Point.Physical) ?Point.Physical {
-    const cw = currentWindow();
-    switch (cw.drag_state) {
-        .none => return null,
-        .dragging => {
-            const dp = p.diff(cw.drag_pt);
-            cw.drag_pt = p;
-            return dp;
-        },
-        .prestart => {
-            const dp = p.diff(cw.drag_pt);
-            const dps = dp.scale(1 / windowNaturalScale(), Point.Natural);
-            if (@abs(dps.x) > 3 or @abs(dps.y) > 3) {
-                cw.drag_pt = p;
-                cw.drag_state = .dragging;
-                return dp;
-            } else {
-                return null;
-            }
-        },
-    }
-}
-
-/// True if `dragging` and `dragStart` (or `dragPreStart`) was given name.
-///
-/// Useful for cross-widget drags.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn draggingName(name: []const u8) bool {
-    const cw = currentWindow();
-    return cw.drag_state == .dragging and cw.drag_name.len > 0 and std.mem.eql(u8, name, cw.drag_name);
-}
-
-/// Stop any mouse drag.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn dragEnd() void {
-    const cw = currentWindow();
-    cw.drag_state = .none;
-    cw.drag_name = "";
-}
+// }}}
 
 /// The difference between the final mouse position this frame and last frame.
 /// Use `mouseTotalMotion().nonZero()` to detect if any mouse motion has occurred.
@@ -2432,743 +3470,7 @@ pub fn mouseTotalMotion() Point.Physical {
     return .diff(cw.mouse_pt, cw.mouse_pt_prev);
 }
 
-/// Used to track which widget holds mouse capture.
-pub const CaptureMouse = struct {
-    /// widget ID
-    id: WidgetId,
-    /// physical pixels (aka capture zone)
-    rect: Rect.Physical,
-    /// subwindow id the widget with capture is in
-    subwindow_id: WidgetId,
-};
-
-/// Capture the mouse for this widget's data.
-/// (i.e. `eventMatch` return true for this widget and false for all others)
-/// and capture is explicitly released when passing `null`.
-///
-/// Tracks the widget's id / subwindow / rect, so that `.position` mouse events can still
-/// be presented to widgets who's rect overlap with the widget holding the capture.
-/// (which is what you would expect for e.g. background highlight)
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn captureMouse(wd: ?*const WidgetData, event_num: u16) void {
-    const cm = if (wd) |data| CaptureMouse{
-        .id = data.id,
-        .rect = data.borderRectScale().r,
-        .subwindow_id = subwindowCurrentId(),
-    } else null;
-    captureMouseCustom(cm, event_num);
-}
-/// In most cases, use `captureMouse` but if you want to customize the
-/// "capture zone" you can use this function instead.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn captureMouseCustom(cm: ?CaptureMouse, event_num: u16) void {
-    const cw = currentWindow();
-    defer cw.capture = cm;
-    if (cm) |capture| {
-        // log.debug("Mouse capture (event {d}): {any}", .{ event_num, cm });
-        cw.captured_last_frame = true;
-        cw.captureEventsInternal(event_num, capture.id);
-    } else {
-        // Unmark all following mouse events
-        cw.captureEventsInternal(event_num, null);
-        // log.debug("Mouse uncapture (event {d}): {?any}", .{ event_num, cw.capture });
-        // for (dvui.events()) |*e| {
-        //     if (e.evt == .mouse) {
-        //         log.debug("{s}: win {?x}, widget {?x}", .{ @tagName(e.evt.mouse.action), e.target_windowId, e.target_widgetId });
-        //     }
-        // }
-    }
-}
-/// If the widget ID passed has mouse capture, this maintains that capture for
-/// the next frame.  This is usually called for you in `WidgetData.init`.
-///
-/// This can be called every frame regardless of capture.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn captureMouseMaintain(cm: CaptureMouse) void {
-    const cw = currentWindow();
-    if (cw.capture != null and cw.capture.?.id == cm.id) {
-        // to maintain capture, we must be on or above the
-        // top modal window
-        var i = cw.subwindows.items.len;
-        while (i > 0) : (i -= 1) {
-            const sw = &cw.subwindows.items[i - 1];
-            if (sw.id == cw.subwindow_currentId) {
-                // maintaining capture
-                // either our floating window is above the top modal
-                // or there are no floating modal windows
-                cw.capture.?.rect = cm.rect;
-                cw.captured_last_frame = true;
-                return;
-            } else if (sw.modal) {
-                // found modal before we found current
-                // cancel the capture, and cancel
-                // any drag being done
-                //
-                // mark all events as not captured, we are being interrupted by
-                // a modal dialog anyway
-                captureMouse(null, 0);
-                dragEnd();
-                return;
-            }
-        }
-    }
-}
-
-/// Test if the passed widget ID currently has mouse capture.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn captured(id: WidgetId) bool {
-    if (captureMouseGet()) |cm| {
-        return id == cm.id;
-    }
-    return false;
-}
-
-/// Get the widget ID that currently has mouse capture or null if none.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn captureMouseGet() ?CaptureMouse {
-    return currentWindow().capture;
-}
-
-/// Get current screen rectangle in pixels that drawing is being clipped to.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn clipGet() Rect.Physical {
-    return currentWindow().clipRect;
-}
-
-/// Intersect the given physical rect with the current clipping rect and set
-/// as the new clipping rect.
-///
-/// Returns the previous clipping rect, use clipSet to restore it.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn clip(new: Rect.Physical) Rect.Physical {
-    const cw = currentWindow();
-    const ret = cw.clipRect;
-    clipSet(cw.clipRect.intersect(new));
-    return ret;
-}
-
-/// Set the current clipping rect to the given physical rect.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn clipSet(r: Rect.Physical) void {
-    currentWindow().clipRect = r;
-}
-
-/// Set snap_to_pixels setting.  If true:
-/// * fonts are rendered at @floor(font.size)
-/// * drawing is generally rounded to the nearest pixel
-///
-/// Returns the previous setting.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn snapToPixelsSet(snap: bool) bool {
-    const cw = currentWindow();
-    const old = cw.snap_to_pixels;
-    cw.snap_to_pixels = snap;
-    return old;
-}
-
-/// Get current snap_to_pixels setting.  See `snapToPixelsSet`.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn snapToPixels() bool {
-    const cw = currentWindow();
-    return cw.snap_to_pixels;
-}
-
-/// Requests another frame to be shown.
-///
-/// This only matters if you are using dvui to manage the framerate (by calling
-/// `Window.waitTime` and using the return value to wait with event
-/// interruption - for example `sdl_backend.waitEventTimeout` at the end of each
-/// frame).
-///
-/// src and id are for debugging, which is enabled by calling
-/// `Window.debugRefresh(true)`.  The debug window has a toggle button for this.
-///
-/// Can be called from any thread.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the Window you want to refresh.  In that case dvui will
-/// go through the backend because the gui thread might be waiting.
-pub fn refresh(win: ?*Window, src: std.builtin.SourceLocation, id: ?WidgetId) void {
-    if (win) |w| {
-        // we are being called from non gui thread, the gui thread might be
-        // sleeping, so need to trigger a wakeup via the backend
-        w.refreshBackend(src, id);
-    } else {
-        if (current_window) |cw| {
-            cw.refreshWindow(src, id);
-        } else {
-            log.err("{s}:{d} refresh current_window was null, pass a *Window as first parameter if calling from other thread or outside window.begin()/end()", .{ src.file, src.line });
-        }
-    }
-}
-
-/// Get the textual content of the system clipboard.  Caller must copy.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn clipboardText() []const u8 {
-    const cw = currentWindow();
-    return cw.backend.clipboardText() catch |err| blk: {
-        logError(@src(), err, "Could not get clipboard text", .{});
-        break :blk "";
-    };
-}
-
-/// Set the textual content of the system clipboard.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn clipboardTextSet(text: []const u8) void {
-    const cw = currentWindow();
-    cw.backend.clipboardTextSet(text) catch |err| {
-        logError(@src(), err, "Could not set clipboard text '{s}'", .{text});
-    };
-}
-
-/// Ask the system to open the given url.
-/// http:// and https:// urls can be opened.
-/// returns true if the backend reports the URL was opened.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn openURL(url: []const u8) bool {
-    const parsed = std.Uri.parse(url) catch return false;
-    if (!std.ascii.eqlIgnoreCase(parsed.scheme, "http") and
-        !std.ascii.eqlIgnoreCase(parsed.scheme, "https"))
-    {
-        return false;
-    }
-    if (parsed.host != null and parsed.host.?.isEmpty()) {
-        return false;
-    }
-
-    const cw = currentWindow();
-    cw.backend.openURL(url) catch |err| {
-        logError(@src(), err, "Could not open url '{s}'", .{url});
-        return false;
-    };
-    return true;
-}
-
-test openURL {
-    try std.testing.expect(openURL("notepad.exe") == false);
-    try std.testing.expect(openURL("https://") == false);
-    try std.testing.expect(openURL("file:///") == false);
-}
-
-/// Seconds elapsed between last frame and current.  This value can be quite
-/// high after a period with no user interaction.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn secondsSinceLastFrame() f32 {
-    return currentWindow().secs_since_last_frame;
-}
-
-/// Average frames per second over the past 30 frames.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn FPS() f32 {
-    return currentWindow().FPS();
-}
-
-/// Get the Widget that would be the parent of a new widget.
-///
-/// ```zig
-/// dvui.parentGet().extendId(@src(), id_extra)
-/// ```
-/// is how new widgets get their id, and can be used to make a unique id without
-/// making a widget.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn parentGet() Widget {
-    return currentWindow().data().parent;
-}
-
-/// Make w the new parent widget.  See `parentGet`.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn parentSet(w: Widget) void {
-    const cw = currentWindow();
-    cw.data().parent = w;
-}
-
-/// Make a previous parent widget the current parent.
-///
-/// Pass the current parent's id.  This is used to detect a coding error where
-/// a widget's `.deinit()` was accidentally not called.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn parentReset(id: WidgetId, w: Widget) void {
-    const cw = currentWindow();
-    const actual_current = cw.data().parent.data().id;
-    if (id != actual_current) {
-        cw.debug.widget_id = actual_current;
-
-        var wd = cw.data().parent.data();
-
-        log.err("widget is not closed within its parent. did you forget to call `.deinit()`?", .{});
-
-        while (true) : (wd = wd.parent.data()) {
-            log.err("  {s}:{d} {s} {x}{s}", .{
-                wd.src.file,
-                wd.src.line,
-                wd.options.name orelse "???",
-                wd.id,
-                if (wd.id == cw.data().id) "\n" else "",
-            });
-
-            if (wd.id == cw.data().id) {
-                // got to base Window
-                break;
-            }
-        }
-    }
-    cw.data().parent = w;
-}
-
-/// Set if dvui should immediately render, and return the previous setting.
-///
-/// If false, the render functions defer until `Window.end`.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn renderingSet(r: bool) bool {
-    const cw = currentWindow();
-    const ret = cw.render_target.rendering;
-    cw.render_target.rendering = r;
-    return ret;
-}
-
-/// Get the OS window size in natural pixels.  Physical pixels might be more on
-/// a hidpi screen or if the user has content scaling.  See `windowRectPixels`.
-///
-/// Natural pixels is the unit for subwindow sizing and placement.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn windowRect() Rect.Natural {
-    // Window.data().rect is the definition of natural
-    return .cast(currentWindow().data().rect);
-}
-
-/// Get the OS window size in pixels.  See `windowRect`.
-///
-/// Pixels is the unit for rendering and user input.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn windowRectPixels() Rect.Physical {
-    return currentWindow().rect_pixels;
-}
-
-/// Get the Rect and scale factor for the OS window.  The Rect is in pixels,
-/// and the scale factor is how many pixels per natural pixel.  See
-/// `windowRect`.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn windowRectScale() RectScale {
-    return currentWindow().rectScale();
-}
-
-/// The natural scale is how many pixels per natural pixel.  Useful for
-/// converting between user input and subwindow size/position.  See
-/// `windowRect`.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn windowNaturalScale() f32 {
-    return currentWindow().natural_scale;
-}
-
-/// True if this is the first frame we've seen this widget id, meaning we don't
-/// know its min size yet.  The widget will record its min size in `.deinit()`.
-///
-/// If a widget is not seen for a frame, its min size will be forgotten and
-/// firstFrame will return true the next frame we see it.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn firstFrame(id: WidgetId) bool {
-    return minSizeGet(id) == null;
-}
-
-/// Get the min size recorded for id from last frame or null if id was not seen
-/// last frame.
-///
-/// Usually you want `minSize` to combine min size from last frame with a min
-/// size provided by the user code.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn minSizeGet(id: WidgetId) ?Size {
-    return currentWindow().min_sizes.get(id);
-}
-
-/// Return the maximum of min_size and the min size for id from last frame.
-///
-/// See `minSizeGet` to get only the min size from last frame.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn minSize(id: WidgetId, min_size: Size) Size {
-    var size = min_size;
-
-    // Need to take the max of both given and previous.  ScrollArea could be
-    // passed a min size Size{.w = 0, .h = 200} meaning to get the width from the
-    // previous min size.
-    if (minSizeGet(id)) |ms| {
-        size = Size.max(size, ms);
-    }
-
-    return size;
-}
-
-/// Make a unique id from `src` and `id_extra`, possibly starting with start
-/// (usually a parent widget id).  This is how the initial parent widget id is
-/// created, and also toasts and dialogs from other threads.
-///
-/// See `Widget.extendId` which calls this with the widget id as start.
-///
-/// ```zig
-/// dvui.parentGet().extendId(@src(), id_extra)
-/// ```
-/// is how new widgets get their id, and can be used to make a unique id without
-/// making a widget.
-pub fn hashSrc(start: ?WidgetId, src: std.builtin.SourceLocation, id_extra: usize) WidgetId {
-    var hash = fnv.init();
-    if (start) |s| {
-        hash.value = s.asU64();
-    }
-    hash.update(std.mem.asBytes(&src.module.ptr));
-    hash.update(std.mem.asBytes(&src.file.ptr));
-    hash.update(std.mem.asBytes(&src.line));
-    hash.update(std.mem.asBytes(&src.column));
-    hash.update(std.mem.asBytes(&id_extra));
-    return @enumFromInt(hash.final());
-}
-
-/// Make a new id by combining id with the contents of key.  This is how dvui
-/// tracks things in `dataGet`/`dataSet`, `animation`, and `timer`.
-pub fn hashIdKey(id: WidgetId, key: []const u8) u64 {
-    var h = fnv.init();
-    h.value = id.asU64();
-    h.update(key);
-    return h.final();
-}
-
-/// Set key/value pair for given id.
-///
-/// Can be called from any thread.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the `Window` you want to add the data to.
-///
-/// Stored data with the same id/key will be overwritten if it has the same size,
-/// otherwise the data will be freed at the next call to `Window.end`. This means
-/// that if a pointer to the same id/key was retrieved earlier, the value behind
-/// that pointer would be modified.
-///
-/// If you want to store the contents of a slice, use `dataSetSlice`.
-pub fn dataSet(win: ?*Window, id: WidgetId, key: []const u8, data: anytype) void {
-    dataSetAdvanced(win, id, key, data, false, 1);
-}
-
-/// Set key/value pair for given id, copying the slice contents. Can be passed
-/// a slice or pointer to an array.
-///
-/// Can be called from any thread.
-///
-/// Stored data with the same id/key will be overwritten if it has the same size,
-/// otherwise the data will be freed at the next call to `Window.end`. This means
-/// that if the slice with the same id/key was retrieved earlier, the value behind
-/// that slice would be modified.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the `Window` you want to add the data to.
-pub fn dataSetSlice(win: ?*Window, id: WidgetId, key: []const u8, data: anytype) void {
-    dataSetSliceCopies(win, id, key, data, 1);
-}
-
-/// Same as `dataSetSlice`, but will copy data `num_copies` times all concatenated
-/// into a single slice.  Useful to get dvui to allocate a specific number of
-/// entries that you want to fill in after.
-pub fn dataSetSliceCopies(win: ?*Window, id: WidgetId, key: []const u8, data: anytype, num_copies: usize) void {
-    const dt = @typeInfo(@TypeOf(data));
-    if (dt == .pointer and dt.pointer.size == .slice) {
-        if (dt.pointer.sentinel()) |s| {
-            dataSetAdvanced(win, id, key, @as([:s]dt.pointer.child, @constCast(data)), true, num_copies);
-        } else {
-            dataSetAdvanced(win, id, key, @as([]dt.pointer.child, @constCast(data)), true, num_copies);
-        }
-    } else if (dt == .pointer and dt.pointer.size == .one and @typeInfo(dt.pointer.child) == .array) {
-        const child_type = @typeInfo(dt.pointer.child);
-        if (child_type.array.sentinel()) |s| {
-            dataSetAdvanced(win, id, key, @as([:s]child_type.array.child, @constCast(data)), true, num_copies);
-        } else {
-            dataSetAdvanced(win, id, key, @as([]child_type.array.child, @constCast(data)), true, num_copies);
-        }
-    } else {
-        @compileError("dataSetSlice needs a slice or pointer to array, given " ++ @typeName(@TypeOf(data)));
-    }
-}
-
-/// Set key/value pair for given id.
-///
-/// Can be called from any thread.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the `Window` you want to add the data to.
-///
-/// Stored data with the same id/key will be freed at next `win.end()`.
-///
-/// If `copy_slice` is true, data must be a slice or pointer to array, and the
-/// contents are copied into internal storage. If false, only the slice itself
-/// (ptr and len) and stored.
-pub fn dataSetAdvanced(win: ?*Window, id: WidgetId, key: []const u8, data: anytype, comptime copy_slice: bool, num_copies: usize) void {
-    if (win) |w| {
-        // we are being called from non gui thread or outside begin()/end()
-        w.dataSetAdvanced(id, key, data, copy_slice, num_copies);
-    } else {
-        if (current_window) |cw| {
-            cw.dataSetAdvanced(id, key, data, copy_slice, num_copies);
-        } else {
-            @panic("dataSet current_window was null, pass a *Window as first parameter if calling from other thread or outside window.begin()/end()");
-        }
-    }
-}
-
-/// Retrieve the value for given key associated with id.
-///
-/// Can be called from any thread.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the `Window` you want to add the data to.
-///
-/// If you want a pointer to the stored data, use `dataGetPtr`.
-///
-/// If you want to get the contents of a stored slice, use `dataGetSlice`.
-pub fn dataGet(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type) ?T {
-    if (dataGetInternal(win, id, key, T, false)) |bytes| {
-        return @as(*T, @alignCast(@ptrCast(bytes.ptr))).*;
-    } else {
-        return null;
-    }
-}
-
-/// Retrieve the value for given key associated with id.  If no value was stored, store default and then return it.
-///
-/// Can be called from any thread.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the `Window` you want to add the data to.
-///
-/// If you want a pointer to the stored data, use `dataGetPtrDefault`.
-///
-/// If you want to get the contents of a stored slice, use `dataGetSlice`.
-pub fn dataGetDefault(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type, default: T) T {
-    if (dataGetInternal(win, id, key, T, false)) |bytes| {
-        return @as(*T, @alignCast(@ptrCast(bytes.ptr))).*;
-    } else {
-        dataSet(win, id, key, default);
-        return default;
-    }
-}
-
-/// Retrieve a pointer to the value for given key associated with id.  If no
-/// value was stored, store default and then return a pointer to the stored
-/// value.
-///
-/// Can be called from any thread.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the `Window` you want to add the data to.
-///
-/// Returns a pointer to internal storage, which will be freed after a frame
-/// where there is no call to any `dataGet`/`dataSet` functions for that id/key
-/// combination.
-///
-/// The pointer will always be valid until the next call to `Window.end`.
-///
-/// If you want to get the contents of a stored slice, use `dataGetSlice`.
-pub fn dataGetPtrDefault(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type, default: T) *T {
-    if (dataGetPtr(win, id, key, T)) |ptr| {
-        return ptr;
-    } else {
-        dataSet(win, id, key, default);
-        return dataGetPtr(win, id, key, T).?;
-    }
-}
-
-/// Retrieve a pointer to the value for given key associated with id.
-///
-/// Can be called from any thread.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the `Window` you want to add the data to.
-///
-/// Returns a pointer to internal storage, which will be freed after a frame
-/// where there is no call to any `dataGet`/`dataSet` functions for that id/key
-/// combination.
-///
-/// The pointer will always be valid until the next call to `Window.end`.
-///
-/// If you want to get the contents of a stored slice, use `dataGetSlice`.
-pub fn dataGetPtr(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type) ?*T {
-    if (dataGetInternal(win, id, key, T, false)) |bytes| {
-        return @as(*T, @alignCast(@ptrCast(bytes.ptr)));
-    } else {
-        return null;
-    }
-}
-
-/// Retrieve slice contents for given key associated with id.
-///
-/// `dataSetSlice` strips const from the slice type, so always call
-/// `dataGetSlice` with a mutable slice type ([]u8, not []const u8).
-///
-/// Can be called from any thread.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the `Window` you want to add the data to.
-///
-/// The returned slice points to internal storage, which will be freed after
-/// a frame where there is no call to any `dataGet`/`dataSet` functions for that
-/// id/key combination.
-///
-/// The slice will always be valid until the next call to `Window.end`.
-pub fn dataGetSlice(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type) ?T {
-    const dt = @typeInfo(T);
-    if (dt != .pointer or dt.pointer.size != .slice) {
-        @compileError("dataGetSlice needs a slice, given " ++ @typeName(T));
-    }
-
-    if (dataGetInternal(win, id, key, T, true)) |bytes| {
-        if (dt.pointer.sentinel()) |sentinel| {
-            return @as([:sentinel]align(@alignOf(dt.pointer.child)) dt.pointer.child, @alignCast(@ptrCast(std.mem.bytesAsSlice(dt.pointer.child, bytes[0 .. bytes.len - @sizeOf(dt.pointer.child)]))));
-        } else {
-            return @as([]align(@alignOf(dt.pointer.child)) dt.pointer.child, @alignCast(std.mem.bytesAsSlice(dt.pointer.child, bytes)));
-        }
-    } else {
-        return null;
-    }
-}
-
-/// Retrieve slice contents for given key associated with id.
-///
-/// If the id/key doesn't exist yet, store the default slice into internal
-/// storage, and then return the internal storage slice.
-///
-/// Can be called from any thread.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the `Window` you want to add the data to.
-///
-/// The returned slice points to internal storage, which will be freed after
-/// a frame where there is no call to any `dataGet`/`dataSet` functions for that
-/// id/key combination.
-///
-/// The slice will always be valid until the next call to `Window.end`.
-pub fn dataGetSliceDefault(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type, default: []const @typeInfo(T).pointer.child) T {
-    return dataGetSlice(win, id, key, T) orelse blk: {
-        dataSetSlice(win, id, key, default);
-        break :blk dataGetSlice(win, id, key, T).?;
-    };
-}
-
-// returns the backing slice of bytes if we have it
-pub fn dataGetInternal(win: ?*Window, id: WidgetId, key: []const u8, comptime T: type, slice: bool) ?[]u8 {
-    if (win) |w| {
-        // we are being called from non gui thread or outside begin()/end()
-        return w.dataGetInternal(id, key, T, slice);
-    } else {
-        if (current_window) |cw| {
-            return cw.dataGetInternal(id, key, T, slice);
-        } else {
-            @panic("dataGet current_window was null, pass a *Window as first parameter if calling from other thread or outside window.begin()/end()");
-        }
-    }
-}
-
-/// Remove key (and data if any) for given id.  The data will be freed at next
-/// `Window.end`.
-///
-/// Can be called from any thread.
-///
-/// If called from non-GUI thread or outside `Window.begin`/`Window.end`, you must
-/// pass a pointer to the `Window` you want to add the dialog to.
-pub fn dataRemove(win: ?*Window, id: WidgetId, key: []const u8) void {
-    if (win) |w| {
-        // we are being called from non gui thread or outside begin()/end()
-        return w.dataRemove(id, key);
-    } else {
-        if (current_window) |cw| {
-            return cw.dataRemove(id, key);
-        } else {
-            @panic("dataRemove current_window was null, pass a *Window as first parameter if calling from other thread or outside window.begin()/end()");
-        }
-    }
-}
-
-/// Return a rect that fits inside avail given the options. avail wins over
-/// `min_size`.
-pub fn placeIn(avail: Rect, min_size: Size, e: Options.Expand, g: Options.Gravity) Rect {
-    var size = min_size;
-
-    // you never get larger than available
-    size.w = @min(size.w, avail.w);
-    size.h = @min(size.h, avail.h);
-
-    switch (e) {
-        .none => {},
-        .horizontal => {
-            size.w = avail.w;
-        },
-        .vertical => {
-            size.h = avail.h;
-        },
-        .both => {
-            size = avail.size();
-        },
-        .ratio => {
-            if (min_size.w > 0 and min_size.h > 0 and avail.w > 0 and avail.h > 0) {
-                const ratio = min_size.w / min_size.h;
-                if (min_size.w > avail.w or min_size.h > avail.h) {
-                    // contracting
-                    const wratio = avail.w / min_size.w;
-                    const hratio = avail.h / min_size.h;
-                    if (wratio < hratio) {
-                        // width is constraint
-                        size.w = avail.w;
-                        size.h = @min(avail.h, wratio * min_size.h);
-                    } else {
-                        // height is constraint
-                        size.h = avail.h;
-                        size.w = @min(avail.w, hratio * min_size.w);
-                    }
-                } else {
-                    // expanding
-                    const aratio = (avail.w - size.w) / (avail.h - size.h);
-                    if (aratio > ratio) {
-                        // height is constraint
-                        size.w = @min(avail.w, avail.h * ratio);
-                        size.h = avail.h;
-                    } else {
-                        // width is constraint
-                        size.w = avail.w;
-                        size.h = @min(avail.h, avail.w / ratio);
-                    }
-                }
-            }
-        },
-    }
-
-    var r = avail.shrinkToSize(size);
-    r.x = avail.x + g.x * (avail.w - r.w);
-    r.y = avail.y + g.y * (avail.h - r.h);
-
-    return r;
-}
-
+// Event handling {{{
 /// Get the slice of `Event`s for this frame.
 ///
 /// Only valid between `Window.begin`and `Window.end`.
@@ -3283,6 +3585,157 @@ pub fn eventMatch(e: *Event, opts: EventMatchOptions) bool {
     }
 
     return true;
+}
+// }}}
+
+// DnD {{{
+/// Optional features you might want when doing a mouse/touch drag.
+pub const DragStartOptions = struct {
+    /// Use this cursor from when a drag starts to when it ends.
+    cursor: ?enums.Cursor = null,
+
+    /// Offset of point of interest from the mouse.  Useful during a drag to
+    /// locate where to move the point of interest.
+    offset: Point.Physical = .{},
+
+    /// Used for cross-widget dragging.  See `draggingName`.
+    name: []const u8 = "",
+};
+
+/// Prepare for a possible mouse drag.  This will detect a drag, and also a
+/// normal click (mouse down and up without a drag).
+///
+/// * `dragging` will return a Point once mouse motion has moved at least 3
+/// natural pixels away from p.
+///
+/// * if cursor is non-null and a drag starts, use that cursor while dragging
+///
+/// * offset given here can be retrieved later with `dragOffset` - example is
+/// dragging bottom right corner of floating window.  The drag can start
+/// anywhere in the hit area (passing the offset to the true corner), then
+/// during the drag, the `dragOffset` is added to the current mouse location to
+/// recover where to move the true corner.
+///
+/// See `dragStart` to immediately start a drag.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn dragPreStart(p: Point.Physical, options: DragStartOptions) void {
+    const cw = currentWindow();
+    cw.drag_state = .prestart;
+    cw.drag_pt = p;
+    cw.drag_offset = options.offset;
+    cw.cursor_dragging = options.cursor;
+    cw.drag_name = options.name;
+}
+
+/// Start a mouse drag from p.  Use when only dragging is possible (normal
+/// click would do nothing), otherwise use `dragPreStart`.
+///
+/// * if cursor is non-null, use that cursor while dragging
+///
+/// * offset given here can be retrieved later with `dragOffset` - example is
+/// dragging bottom right corner of floating window.  The drag can start
+/// anywhere in the hit area (passing the offset to the true corner), then
+/// during the drag, the `dragOffset` is added to the current mouse location to
+/// recover where to move the true corner.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn dragStart(p: Point.Physical, options: DragStartOptions) void {
+    const cw = currentWindow();
+    cw.drag_state = .dragging;
+    cw.drag_pt = p;
+    cw.drag_offset = options.offset;
+    cw.cursor_dragging = options.cursor;
+    cw.drag_name = options.name;
+}
+
+/// Get offset previously given to `dragPreStart` or `dragStart`.  See those.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn dragOffset() Point.Physical {
+    const cw = currentWindow();
+    return cw.drag_offset;
+}
+
+/// If a mouse drag is happening, return the pixel difference to p from the
+/// previous dragging call or the drag starting location (from `dragPreStart`
+/// or `dragStart`).  Otherwise return null, meaning a drag hasn't started yet.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn dragging(p: Point.Physical) ?Point.Physical {
+    const cw = currentWindow();
+    switch (cw.drag_state) {
+        .none => return null,
+        .dragging => {
+            const dp = p.diff(cw.drag_pt);
+            cw.drag_pt = p;
+            return dp;
+        },
+        .prestart => {
+            const dp = p.diff(cw.drag_pt);
+            const dps = dp.scale(1 / windowNaturalScale(), Point.Natural);
+            if (@abs(dps.x) > 3 or @abs(dps.y) > 3) {
+                cw.drag_pt = p;
+                cw.drag_state = .dragging;
+                return dp;
+            } else {
+                return null;
+            }
+        },
+    }
+}
+
+/// True if `dragging` and `dragStart` (or `dragPreStart`) was given name.
+///
+/// Useful for cross-widget drags.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn draggingName(name: []const u8) bool {
+    const cw = currentWindow();
+    return cw.drag_state == .dragging and cw.drag_name.len > 0 and std.mem.eql(u8, name, cw.drag_name);
+}
+
+/// Stop any mouse drag.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn dragEnd() void {
+    const cw = currentWindow();
+    cw.drag_state = .none;
+    cw.drag_name = "";
+}
+// }}}
+
+// Clipboard Management {{{
+/// Get the textual content of the system clipboard.  Caller must copy.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn clipboardText() []const u8 {
+    const cw = currentWindow();
+    return cw.backend.clipboardText() catch |err| blk: {
+        logError(@src(), err, "Could not get clipboard text", .{});
+        break :blk "";
+    };
+}
+
+/// Set the textual content of the system clipboard.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn clipboardTextSet(text: []const u8) void {
+    const cw = currentWindow();
+    cw.backend.clipboardTextSet(text) catch |err| {
+        logError(@src(), err, "Could not set clipboard text '{s}'", .{text});
+    };
+}
+// }}}
+
+/// Set cursor the app should use if not already set this frame.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn cursorSet(cursor: enums.Cursor) void {
+    const cw = currentWindow();
+    if (cw.cursor_requested == null) {
+        cw.cursor_requested = cursor;
+    }
 }
 
 pub const ClickOptions = struct {
@@ -3477,6 +3930,7 @@ pub fn timerDoneOrNone(id: WidgetId) bool {
     return timerDone(id) or (timerGet(id) == null);
 }
 
+// Automated Scrolling {{{
 pub const ScrollToOptions = struct {
     // rect in screen coords we want to be visible (might be outside
     // scrollarea's clipping region - we want to scroll to bring it inside)
@@ -3516,6 +3970,7 @@ pub fn scrollDrag(scroll_drag: ScrollDragOptions) void {
         scroll.processScrollDrag(scroll_drag);
     }
 }
+// }}}
 
 pub const TabIndex = struct {
     windowId: WidgetId,
@@ -3635,101 +4090,6 @@ pub fn tabIndexPrev(event_num: ?u16) void {
     }
 
     focusWidget(newId, null, event_num);
-}
-
-/// Widgets that accept text input should call this on frames they have focus.
-///
-/// It communicates:
-/// * text input should happen (maybe shows an on screen keyboard)
-/// * rect on screen (position possible IME window)
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn wantTextInput(r: Rect.Natural) void {
-    const cw = currentWindow();
-    cw.text_input_rect = r;
-}
-
-/// Temporary menu that floats above current layer.  Usually contains multiple
-/// `menuItemLabel`, `menuItemIcon`, or `menuItem`, but can contain any
-/// widgets.
-///
-/// Clicking outside of the menu or any child menus closes it.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn floatingMenu(src: std.builtin.SourceLocation, init_opts: FloatingMenuWidget.InitOptions, opts: Options) *FloatingMenuWidget {
-    var ret = widgetAlloc(FloatingMenuWidget);
-    ret.* = FloatingMenuWidget.init(src, init_opts, opts);
-    ret.install();
-    return ret;
-}
-
-/// Subwindow that the user can generally resize and move around.
-///
-/// Usually you want to add `windowHeader` as the first child.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn floatingWindow(src: std.builtin.SourceLocation, floating_opts: FloatingWindowWidget.InitOptions, opts: Options) *FloatingWindowWidget {
-    var ret = widgetAlloc(FloatingWindowWidget);
-    ret.* = FloatingWindowWidget.init(src, floating_opts, opts);
-    ret.install();
-    ret.processEventsBefore();
-    ret.drawBackground();
-    return ret;
-}
-
-/// Normal widgets seen at the top of `floatingWindow`.  Includes a close
-/// button, centered title str, and right_str on the right.
-///
-/// Handles raising and focusing the subwindow on click.  To make
-/// `floatingWindow` only move on a click-drag in the header, use:
-///
-/// floating_win.dragAreaSet(dvui.windowHeader("Title", "", show_flag));
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn windowHeader(str: []const u8, right_str: []const u8, openflag: ?*bool) Rect.Physical {
-    var over = dvui.overlay(@src(), .{ .expand = .horizontal, .name = "WindowHeader" });
-
-    dvui.labelNoFmt(@src(), str, .{}, .{ .gravity_x = 0.5, .gravity_y = 0.5, .expand = .horizontal, .font_style = .heading, .padding = .{ .x = 6, .y = 6, .w = 6, .h = 4 } });
-
-    if (openflag) |of| {
-        if (dvui.buttonIcon(
-            @src(),
-            "close",
-            entypo.cross,
-            .{},
-            .{},
-            .{ .font_style = .heading, .corner_radius = Rect.all(1000), .padding = Rect.all(2), .margin = Rect.all(2), .gravity_y = 0.5, .expand = .ratio },
-        )) {
-            of.* = false;
-        }
-    }
-
-    dvui.labelNoFmt(@src(), right_str, .{}, .{ .gravity_x = 1.0 });
-
-    const evts = events();
-    for (evts) |*e| {
-        if (!eventMatch(e, .{ .id = over.data().id, .r = over.data().contentRectScale().r }))
-            continue;
-
-        if (e.evt == .mouse and e.evt.mouse.action == .press and e.evt.mouse.button.pointer()) {
-            // raise this subwindow but let the press continue so the window
-            // will do the drag-move
-            raiseSubwindow(subwindowCurrentId());
-        } else if (e.evt == .mouse and e.evt.mouse.action == .focus) {
-            // our window will already be focused, but this prevents the window
-            // from clearing the focused widget
-            e.handle(@src(), over.data());
-        }
-    }
-
-    var ret = over.data().rectScale().r;
-
-    over.deinit();
-
-    const swd = dvui.separator(@src(), .{ .expand = .horizontal });
-    ret.h += swd.rectScale().r.h;
-
-    return ret;
 }
 
 pub const DialogDisplayFn = *const fn (WidgetId) anyerror!void;
@@ -4210,6 +4570,115 @@ pub fn dialogNativeFolderSelect(alloc: std.mem.Allocator, opts: DialogNativeFold
     // figure out a way to get it to release that.
 
     return result;
+}
+
+/// Widgets that accept text input should call this on frames they have focus.
+///
+/// It communicates:
+/// * text input should happen (maybe shows an on screen keyboard)
+/// * rect on screen (position possible IME window)
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn wantTextInput(r: Rect.Natural) void {
+    const cw = currentWindow();
+    cw.text_input_rect = r;
+}
+
+/// Shim to make widget ids unique.
+///
+/// Useful when you wrap some widgets into a function, but that function does
+/// not have a parent widget.  See makeLabels() in src/Examples.zig
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn virtualParent(src: std.builtin.SourceLocation, opts: Options) *VirtualParentWidget {
+    var ret = widgetAlloc(VirtualParentWidget);
+    ret.* = VirtualParentWidget.init(src, opts);
+    ret.install();
+    return ret;
+}
+
+// Widgets {{{
+/// Temporary menu that floats above current layer.  Usually contains multiple
+/// `menuItemLabel`, `menuItemIcon`, or `menuItem`, but can contain any
+/// widgets.
+///
+/// Clicking outside of the menu or any child menus closes it.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn floatingMenu(src: std.builtin.SourceLocation, init_opts: FloatingMenuWidget.InitOptions, opts: Options) *FloatingMenuWidget {
+    var ret = widgetAlloc(FloatingMenuWidget);
+    ret.* = FloatingMenuWidget.init(src, init_opts, opts);
+    ret.install();
+    return ret;
+}
+
+/// Subwindow that the user can generally resize and move around.
+///
+/// Usually you want to add `windowHeader` as the first child.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn floatingWindow(src: std.builtin.SourceLocation, floating_opts: FloatingWindowWidget.InitOptions, opts: Options) *FloatingWindowWidget {
+    var ret = widgetAlloc(FloatingWindowWidget);
+    ret.* = FloatingWindowWidget.init(src, floating_opts, opts);
+    ret.install();
+    ret.processEventsBefore();
+    ret.drawBackground();
+    return ret;
+}
+
+/// Normal widgets seen at the top of `floatingWindow`.  Includes a close
+/// button, centered title str, and right_str on the right.
+///
+/// Handles raising and focusing the subwindow on click.  To make
+/// `floatingWindow` only move on a click-drag in the header, use:
+///
+/// floating_win.dragAreaSet(dvui.windowHeader("Title", "", show_flag));
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn windowHeader(str: []const u8, right_str: []const u8, openflag: ?*bool) Rect.Physical {
+    var over = dvui.overlay(@src(), .{ .expand = .horizontal, .name = "WindowHeader" });
+
+    dvui.labelNoFmt(@src(), str, .{}, .{ .gravity_x = 0.5, .gravity_y = 0.5, .expand = .horizontal, .font_style = .heading, .padding = .{ .x = 6, .y = 6, .w = 6, .h = 4 } });
+
+    if (openflag) |of| {
+        if (dvui.buttonIcon(
+            @src(),
+            "close",
+            entypo.cross,
+            .{},
+            .{},
+            .{ .font_style = .heading, .corner_radius = Rect.all(1000), .padding = Rect.all(2), .margin = Rect.all(2), .gravity_y = 0.5, .expand = .ratio },
+        )) {
+            of.* = false;
+        }
+    }
+
+    dvui.labelNoFmt(@src(), right_str, .{}, .{ .gravity_x = 1.0 });
+
+    const evts = events();
+    for (evts) |*e| {
+        if (!eventMatch(e, .{ .id = over.data().id, .r = over.data().contentRectScale().r }))
+            continue;
+
+        if (e.evt == .mouse and e.evt.mouse.action == .press and e.evt.mouse.button.pointer()) {
+            // raise this subwindow but let the press continue so the window
+            // will do the drag-move
+            raiseSubwindow(subwindowCurrentId());
+        } else if (e.evt == .mouse and e.evt.mouse.action == .focus) {
+            // our window will already be focused, but this prevents the window
+            // from clearing the focused widget
+            e.handle(@src(), over.data());
+        }
+    }
+
+    var ret = over.data().rectScale().r;
+
+    over.deinit();
+
+    const swd = dvui.separator(@src(), .{ .expand = .horizontal });
+    ret.h += swd.rectScale().r.h;
+
+    return ret;
 }
 
 pub const Toast = struct {
@@ -4715,19 +5184,6 @@ pub fn tooltip(src: std.builtin.SourceLocation, init_opts: FloatingTooltipWidget
     tt.deinit();
 }
 
-/// Shim to make widget ids unique.
-///
-/// Useful when you wrap some widgets into a function, but that function does
-/// not have a parent widget.  See makeLabels() in src/Examples.zig
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn virtualParent(src: std.builtin.SourceLocation, opts: Options) *VirtualParentWidget {
-    var ret = widgetAlloc(VirtualParentWidget);
-    ret.* = VirtualParentWidget.init(src, opts);
-    ret.install();
-    return ret;
-}
-
 /// Lays out children according to gravity anywhere inside.  Useful to overlap
 /// children.
 ///
@@ -5151,7 +5607,14 @@ pub fn menuItem(src: std.builtin.SourceLocation, init_opts: MenuItemWidget.InitO
 
 /// A clickable label.  Good for hyperlinks.
 /// Returns true if it's been clicked.
-pub fn labelClick(src: std.builtin.SourceLocation, comptime fmt: []const u8, args: anytype, init_opts: LabelWidget.InitOptions, opts: Options) bool {
+pub fn labelClick(
+    src: std.builtin.SourceLocation,
+    comptime fmt: []const u8,
+    args: anytype,
+    init_opts: LabelWidget.InitOptions,
+    opts: Options
+    ) bool
+{
     var lw = LabelWidget.init(src, fmt, args, init_opts, opts.override(.{ .name = "LabelClick" }));
     // now lw has a Rect from its parent but hasn't processed events or drawn
 
@@ -5228,6 +5691,21 @@ pub fn icon(src: std.builtin.SourceLocation, name: []const u8, tvg_bytes: []cons
     iw.install();
     iw.draw();
     iw.deinit();
+}
+
+/// Get the width of an icon at a specified height.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn iconWidth(name: []const u8, tvg_bytes: []const u8, height: f32) TvgError!f32 {
+    if (height == 0) return 0.0;
+    var stream = std.io.fixedBufferStream(tvg_bytes);
+    var parser = tvg.tvg.parse(currentWindow().arena(), stream.reader()) catch |err| {
+        log.warn("iconWidth Tinyvg error {!} parsing icon {s}\n", .{ err, name });
+        return TvgError.tvgError;
+    };
+    defer parser.deinit();
+
+    return height * @as(f32, @floatFromInt(parser.header.width)) / @as(f32, @floatFromInt(parser.header.height));
 }
 
 /// Source data for `image()` and `imageSize()`.
@@ -5469,57 +5947,6 @@ pub fn image(src: std.builtin.SourceLocation, init_opts: ImageInitOptions, opts:
     wd.minSizeReportToParent();
 
     return wd;
-}
-
-pub fn debugFontAtlases(src: std.builtin.SourceLocation, opts: Options) void {
-    const cw = currentWindow();
-
-    var width: u32 = 0;
-    var height: u32 = 0;
-    var it = cw.font_cache.iterator();
-    while (it.next()) |kv| {
-        const texture_atlas = kv.value_ptr.getTextureAtlas() catch |err| {
-            // TODO: Maybe FontCacheEntry should keep the font name for debugging? (FIX BELLOW TOO)
-            dvui.logError(@src(), err, "Could not get texture atlast with key {x} at height {d}", .{ kv.key_ptr.*, kv.value_ptr.height });
-            continue;
-        };
-        width = @max(width, texture_atlas.width);
-        height += texture_atlas.height;
-    }
-
-    const sizePhys: Size.Physical = .{ .w = @floatFromInt(width), .h = @floatFromInt(height) };
-
-    const ss = parentGet().screenRectScale(Rect{}).s;
-    const size = sizePhys.scale(1.0 / ss, Size);
-
-    var wd = WidgetData.init(src, .{}, opts.override(.{ .name = "debugFontAtlases", .min_size_content = size }));
-    wd.register();
-
-    wd.borderAndBackground(.{});
-
-    var rs = wd.parent.screenRectScale(placeIn(wd.contentRect(), size, .none, opts.gravityGet()));
-    const color = opts.color(.text);
-
-    if (cw.snap_to_pixels) {
-        rs.r.x = @round(rs.r.x);
-        rs.r.y = @round(rs.r.y);
-    }
-
-    it = cw.font_cache.iterator();
-    while (it.next()) |kv| {
-        const texture_atlas = kv.value_ptr.getTextureAtlas() catch continue;
-        rs.r = rs.r.toSize(.{
-            .w = @floatFromInt(texture_atlas.width),
-            .h = @floatFromInt(texture_atlas.height),
-        });
-        renderTexture(texture_atlas, rs, .{ .colormod = color }) catch |err| {
-            logError(@src(), err, "Could not render font atlast", .{});
-        };
-        rs.r.y += rs.r.h;
-    }
-
-    wd.minSizeSetAndRefresh();
-    wd.minSizeReportToParent();
 }
 
 pub fn button(src: std.builtin.SourceLocation, label_str: []const u8, init_opts: ButtonWidget.InitOptions, opts: Options) bool {
@@ -6089,6 +6516,7 @@ pub fn sliderEntry(src: std.builtin.SourceLocation, comptime label_fmt: ?[]const
     return ret;
 }
 
+// Slider Vector {{{
 fn isF32Slice(comptime ptr: std.builtin.Type.Pointer, comptime child_info: std.builtin.Type) bool {
     const is_slice = ptr.size == .slice;
     const holds_f32 = switch (child_info) {
@@ -6161,6 +6589,7 @@ pub fn sliderVector(line: std.builtin.SourceLocation, comptime fmt: []const u8, 
 
     return any_changed;
 }
+// }}}
 
 pub var progress_defaults: Options = .{
     .padding = Rect.all(2),
@@ -6729,446 +7158,75 @@ pub fn colorPicker(src: std.builtin.SourceLocation, init_opts: ColorPickerInitOp
     return changed;
 }
 
-pub const renderTextOptions = struct {
-    font: Font,
-    text: []const u8,
-    rs: RectScale,
-    color: Color,
-    sel_start: ?usize = null,
-    sel_end: ?usize = null,
-    sel_color: ?Color = null,
-    sel_color_bg: ?Color = null,
-    debug: bool = false,
-};
-
-// only renders a single line of text
-pub fn renderText(opts: renderTextOptions) Backend.GenericError!void {
-    if (opts.rs.s == 0) return;
-    if (opts.text.len == 0) return;
-    if (clipGet().intersect(opts.rs.r).empty()) return;
-
-    var cw = currentWindow();
-    const utf8_text = try toUtf8(cw.lifo(), opts.text);
-    defer if (opts.text.ptr != utf8_text.ptr) cw.lifo().free(utf8_text);
-
-    if (!cw.render_target.rendering) {
-        var opts_copy = opts;
-        opts_copy.text = try cw.arena().dupe(u8, utf8_text);
-        const cmd = RenderCommand{ .snap = cw.snap_to_pixels, .clip = clipGet(), .cmd = .{ .text = opts_copy } };
-
-        var sw = cw.subwindowCurrent();
-        try sw.render_cmds.append(cw.arena(), cmd);
-        return;
-    }
-
-    const target_size = opts.font.size * opts.rs.s;
-    const sized_font = opts.font.resize(target_size);
-
-    // might get a slightly smaller font
-    var fce = try fontCacheGet(sized_font);
-
-    // this must be synced with Font.textSizeEx()
-    const target_fraction = if (cw.snap_to_pixels) 1.0 else target_size / fce.height;
-
-    // make sure the cache has all the glyphs we need
-    var utf8it = std.unicode.Utf8View.initUnchecked(utf8_text).iterator();
-    while (utf8it.nextCodepoint()) |codepoint| {
-        _ = try fce.glyphInfoGetOrReplacement(@as(u32, @intCast(codepoint)), opts.font.name);
-    }
-
-    // Generate new texture atlas if needed to update glyph uv coords
-    const texture_atlas = fce.getTextureAtlas() catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        else => {
-            log.err("Could not get texture atlas for font {s}, text area marked in magenta, to display '{s}'", .{ opts.font.name, opts.text });
-            opts.rs.r.fill(.{}, .{ .color = .magenta });
-            return;
-        },
-    };
-
-    // Over allocate the internal buffers assuming each byte is a character
-    var builder = try Triangles.Builder.init(cw.lifo(), 4 * utf8_text.len, 6 * utf8_text.len);
-    defer builder.deinit(cw.lifo());
-
-    const x_start: f32 = if (cw.snap_to_pixels) @round(opts.rs.r.x) else opts.rs.r.x;
-    var x = x_start;
-    var max_x = x_start;
-    const y: f32 = if (cw.snap_to_pixels) @round(opts.rs.r.y) else opts.rs.r.y;
-
-    if (opts.debug) {
-        log.debug("renderText x {d} y {d}\n", .{ x, y });
-    }
-
-    var sel_in: bool = false;
-    var sel_start_x: f32 = x;
-    var sel_end_x: f32 = x;
-    var sel_max_y: f32 = y;
-    var sel_start: usize = opts.sel_start orelse 0;
-    sel_start = @min(sel_start, utf8_text.len);
-    var sel_end: usize = opts.sel_end orelse 0;
-    sel_end = @min(sel_end, utf8_text.len);
-    // if we will definitely have a selected region or not
-    const sel: bool = sel_start < sel_end;
-
-    const atlas_size: Size = .{ .w = @floatFromInt(texture_atlas.width), .h = @floatFromInt(texture_atlas.height) };
-
-    var bytes_seen: usize = 0;
-    utf8it = std.unicode.Utf8View.initUnchecked(utf8_text).iterator();
-    var last_codepoint: u32 = 0;
-    var last_glyph_index: u32 = 0;
-    while (utf8it.nextCodepoint()) |codepoint| {
-        const gi = try fce.glyphInfoGetOrReplacement(@as(u32, @intCast(codepoint)), opts.font.name);
-
-        // kerning
-        if (last_codepoint != 0) {
-            if (useFreeType) {
-                if (last_glyph_index == 0) last_glyph_index = c.FT_Get_Char_Index(fce.face, last_codepoint);
-                const glyph_index: u32 = c.FT_Get_Char_Index(fce.face, codepoint);
-                var kern: c.FT_Vector = undefined;
-                FontCacheEntry.intToError(c.FT_Get_Kerning(fce.face, last_glyph_index, glyph_index, c.FT_KERNING_DEFAULT, &kern)) catch |err| {
-                    log.warn("renderText freetype error {!} trying to FT_Get_Kerning font {s} codepoints {d} {d}\n", .{ err, opts.font.name, last_codepoint, codepoint });
-                    // Set fallback kern and continue to the best of out ability
-                    kern.x = 0;
-                    kern.y = 0;
-                    // return FontError.fontError;
-                };
-                last_glyph_index = glyph_index;
-
-                const kern_x: f32 = @as(f32, @floatFromInt(kern.x)) / 64.0;
-
-                x += kern_x;
-            } else {
-                const kern_adv: c_int = c.stbtt_GetCodepointKernAdvance(&fce.face, @as(c_int, @intCast(last_codepoint)), @as(c_int, @intCast(codepoint)));
-                const kern_x = fce.scaleFactor * @as(f32, @floatFromInt(kern_adv));
-
-                x += kern_x;
-            }
-        }
-        last_codepoint = codepoint;
-
-        const nextx = x + gi.advance * target_fraction;
-
-        if (sel) {
-            bytes_seen += std.unicode.utf8CodepointSequenceLength(codepoint) catch unreachable;
-            if (!sel_in and bytes_seen > sel_start and bytes_seen <= sel_end) {
-                // entering selection
-                sel_in = true;
-                sel_start_x = x;
-            } else if (sel_in and bytes_seen > sel_end) {
-                // leaving selection
-                sel_in = false;
-            }
-
-            if (sel_in) {
-                // update selection
-                sel_end_x = nextx;
-            }
-        }
-
-        // don't output triangles for a zero-width glyph (space seems to be the only one)
-        if (gi.w > 0) {
-            const vtx_offset: u16 = @intCast(builder.vertexes.items.len);
-            var v: Vertex = undefined;
-
-            v.pos.x = x + gi.leftBearing * target_fraction;
-            v.pos.y = y + gi.topBearing * target_fraction;
-            v.col = .fromColor(if (sel_in) opts.sel_color orelse opts.color else opts.color);
-            v.uv = gi.uv;
-            builder.appendVertex(v);
-
-            if (opts.debug) {
-                log.debug(" - x {d} y {d}", .{ v.pos.x, v.pos.y });
-            }
-
-            if (opts.debug) {
-                //log.debug("{d} pad {d} minx {d} maxx {d} miny {d} maxy {d} x {d} y {d}", .{ bytes_seen, pad, gi.minx, gi.maxx, gi.miny, gi.maxy, v.pos.x, v.pos.y });
-                //log.debug("{d} pad {d} left {d} top {d} w {d} h {d} advance {d}", .{ bytes_seen, pad, gi.f2_leftBearing, gi.f2_topBearing, gi.f2_w, gi.f2_h, gi.f2_advance });
-            }
-
-            v.pos.x = x + (gi.leftBearing + gi.w) * target_fraction;
-            max_x = v.pos.x;
-            v.uv[0] = gi.uv[0] + gi.w / atlas_size.w;
-            builder.appendVertex(v);
-
-            v.pos.y = y + (gi.topBearing + gi.h) * target_fraction;
-            sel_max_y = @max(sel_max_y, v.pos.y);
-            v.uv[1] = gi.uv[1] + gi.h / atlas_size.h;
-            builder.appendVertex(v);
-
-            v.pos.x = x + gi.leftBearing * target_fraction;
-            v.uv[0] = gi.uv[0];
-            builder.appendVertex(v);
-
-            // triangles must be counter-clockwise (y going down) to avoid backface culling
-            builder.appendTriangles(&.{
-                vtx_offset + 0, vtx_offset + 2, vtx_offset + 1,
-                vtx_offset + 0, vtx_offset + 3, vtx_offset + 2,
-            });
-        }
-
-        x = nextx;
-    }
-
-    if (sel) {
-        if (opts.sel_color_bg) |bgcol| {
-            Rect.Physical.fromPoint(.{ .x = sel_start_x, .y = opts.rs.r.y })
-                .toPoint(.{
-                    .x = sel_end_x,
-                    .y = @max(sel_max_y, opts.rs.r.y + fce.height * target_fraction * opts.font.line_height_factor),
-                })
-                .fill(.{}, .{ .color = bgcol, .blur = 0 });
-        }
-    }
-
-    try renderTriangles(builder.build_unowned(), texture_atlas);
-}
-
-/// Create a texture that can be rendered with `renderTexture`.
-///
-/// Remember to destroy the texture at some point, see `textureDestroyLater`.
-///
-/// Only valid between `Window.begin` and `Window.end`.
-pub fn textureCreate(pixels: []const Color.PMA, width: u32, height: u32, interpolation: enums.TextureInterpolation) Backend.TextureError!Texture {
-    if (pixels.len != width * height) {
-        log.err("Texture was created with an incorrect amount of pixels, expected {d} but got {d} (w: {d}, h: {d})", .{ pixels.len, width * height, width, height });
-    }
-    return currentWindow().backend.textureCreate(@ptrCast(pixels.ptr), width, height, interpolation);
-}
-
-/// Update a texture that was created with `textureCreate`.
-///
-/// this is only valid to call while the Texture is not destroyed!
-///
-/// Only valid between `Window.begin` and `Window.end`.
-pub fn textureUpdate(Self: *Texture, pma: []const dvui.Color.PMA, interpolation: enums.TextureInterpolation) !void {
-    if (pma.len != Self.width * Self.height) @panic("Texture size and supplied Content did not match");
-    currentWindow().backend.textureUpdate(Self.*, @ptrCast(pma.ptr)) catch |err| {
-        // texture update not supported by backend, destroy and create texture
-        if (err == Backend.TextureError.NotImplemented) {
-            const new_tex = try textureCreate(pma, Self.width, Self.height, interpolation);
-            textureDestroyLater(Self.*);
-            Self.* = new_tex;
-        } else {
-            return err;
-        }
-    };
-}
-
-/// Create a texture that can be rendered with `renderTexture` and drawn to
-/// with `renderTarget`.  Starts transparent (all zero).
-///
-/// Remember to destroy the texture at some point, see `textureDestroyLater`.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn textureCreateTarget(width: u32, height: u32, interpolation: enums.TextureInterpolation) Backend.TextureError!TextureTarget {
-    return try currentWindow().backend.textureCreateTarget(width, height, interpolation);
-}
-
-/// Read pixels from texture created with `textureCreateTarget`.
-///
-/// Returns pixels allocated by arena.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn textureReadTarget(arena: std.mem.Allocator, texture: TextureTarget) Backend.TextureError![]Color.PMA {
-    const size: usize = texture.width * texture.height * @sizeOf(Color.PMA);
-    const pixels = try arena.alloc(u8, size);
-    errdefer arena.free(pixels);
-
-    try currentWindow().backend.textureReadTarget(texture, pixels.ptr);
-
-    return @ptrCast(pixels);
-}
-
-/// Convert a target texture to a normal texture.  target is destroyed.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn textureFromTarget(target: TextureTarget) Backend.TextureError!Texture {
-    return currentWindow().backend.textureFromTarget(target);
-}
-
-/// Destroy a texture created with `textureCreate` at the end of the frame.
-///
-/// While `Backend.textureDestroy` immediately destroys the texture, this
-/// function deferres the destruction until the end of the frame, so it is safe
-/// to use even in a subwindow where rendering is deferred.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn textureDestroyLater(texture: Texture) void {
-    const cw = currentWindow();
-    cw.texture_trash.append(cw.arena(), texture) catch |err| {
-        dvui.log.err("textureDestroyLater got {!}\n", .{err});
-    };
-}
-
-pub const RenderTarget = struct {
-    texture: ?TextureTarget,
-    offset: Point.Physical,
-    rendering: bool = true,
-};
-
-/// Change where dvui renders.  Can pass output from `textureCreateTarget` or
-/// null for the screen.  Returns the previous target/offset.
-///
-/// offset will be subtracted from all dvui rendering, useful as the point on
-/// the screen the texture will map to.
-///
-/// Useful for caching expensive renders or to save a render for export.  See
-/// `Picture`.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn renderTarget(args: RenderTarget) RenderTarget {
-    var cw = currentWindow();
-    const ret = cw.render_target;
-    cw.backend.renderTarget(args.texture) catch |err| {
-        // TODO: This might be unrecoverable? Or brake rendering too badly?
-        logError(@src(), err, "Failed to set render target", .{});
-        return ret;
-    };
-    cw.render_target = args;
+pub fn plot(src: std.builtin.SourceLocation, plot_opts: PlotWidget.InitOptions, opts: Options) *PlotWidget {
+    var ret = widgetAlloc(PlotWidget);
+    ret.* = PlotWidget.init(src, plot_opts, opts);
+    ret.install();
     return ret;
 }
 
-pub const RenderTextureOptions = struct {
-    rotation: f32 = 0,
-    colormod: Color = .{},
-    corner_radius: Rect = .{},
-    uv: Rect = .{ .w = 1, .h = 1 },
-    background_color: ?Color = null,
-    debug: bool = false,
-};
+pub fn plotXY(src: std.builtin.SourceLocation, plot_opts: PlotWidget.InitOptions, thick: f32, xs: []const f64, ys: []const f64, opts: Options) void {
+    const defaults: Options = .{ .padding = .{} };
+    var p = dvui.plot(src, plot_opts, defaults.override(opts));
 
-pub fn renderTexture(tex: Texture, rs: RectScale, opts: RenderTextureOptions) Backend.GenericError!void {
-    if (rs.s == 0) return;
-    if (clipGet().intersect(rs.r).empty()) return;
-
-    var cw = currentWindow();
-
-    if (!cw.render_target.rendering) {
-        const cmd = RenderCommand{ .snap = cw.snap_to_pixels, .clip = clipGet(), .cmd = .{ .texture = .{ .tex = tex, .rs = rs, .opts = opts } } };
-
-        var sw = cw.subwindowCurrent();
-        try sw.render_cmds.append(cw.arena(), cmd);
-        return;
+    var s1 = p.line();
+    for (xs, ys) |x, y| {
+        s1.point(x, y);
     }
 
-    var path: Path.Builder = .init(dvui.currentWindow().lifo());
-    defer path.deinit();
+    s1.stroke(thick, opts.color(.accent));
 
-    path.addRect(rs.r, opts.corner_radius.scale(rs.s, Rect.Physical));
-
-    var triangles = try path.build().fillConvexTriangles(cw.lifo(), .{ .color = opts.colormod });
-    defer triangles.deinit(cw.lifo());
-
-    triangles.uvFromRectuv(rs.r, opts.uv);
-    triangles.rotate(rs.r.center(), opts.rotation);
-
-    if (opts.background_color) |bg_col| {
-        var back_tri = try triangles.dupe(cw.lifo());
-        defer back_tri.deinit(cw.lifo());
-
-        back_tri.color(bg_col);
-        try renderTriangles(back_tri, null);
-    }
-
-    try renderTriangles(triangles, tex);
+    s1.deinit();
+    p.deinit();
 }
+// }}}
 
-pub fn renderIcon(name: []const u8, tvg_bytes: []const u8, rs: RectScale, opts: RenderTextureOptions, icon_opts: IconRenderOptions) Backend.GenericError!void {
-    if (rs.s == 0) return;
-    if (clipGet().intersect(rs.r).empty()) return;
-
-    // Ask for an integer size icon, then render it to fit rs
-    const target_size = rs.r.h;
-    const ask_height = @ceil(target_size);
-
-    var h = fnv.init();
-    h.update(std.mem.asBytes(&tvg_bytes.ptr));
-    h.update(std.mem.asBytes(&ask_height));
-    h.update(std.mem.asBytes(&icon_opts));
-    const hash = h.final();
-
-    const texture = textureGetCached(hash) orelse blk: {
-        const texture = Texture.fromTvgFile(name, tvg_bytes, @intFromFloat(ask_height), icon_opts) catch |err| {
-            logError(@src(), err, "Could not create texture from tvg file \"{s}\"", .{name});
-            return;
-        };
-        textureAddToCache(hash, texture);
-        break :blk texture;
+// Utilities {{{
+/// Takes in svg bytes and returns a tvg bytes that can be used
+/// with `icon` or `iconTexture`
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn svgToTvg(allocator: std.mem.Allocator, svg_bytes: []const u8) (std.mem.Allocator.Error || TvgError)![]const u8 {
+    return tvg.tvg_from_svg(allocator, svg_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => {
+            log.debug("SvgToTvg returned {!}", .{err});
+            return TvgError.tvgError;
+        },
     };
-
-    try renderTexture(texture, rs, opts);
 }
 
-pub fn renderImage(source: ImageSource, rs: RectScale, opts: RenderTextureOptions) (Backend.TextureError || StbImageError)!void {
-    if (rs.s == 0) return;
-    if (clipGet().intersect(rs.r).empty()) return;
-    try renderTexture(try source.getTexture(), rs, opts);
+/// Ask the system to open the given url.
+/// http:// and https:// urls can be opened.
+/// returns true if the backend reports the URL was opened.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn openURL(url: []const u8) bool {
+    const parsed = std.Uri.parse(url) catch return false;
+    if (!std.ascii.eqlIgnoreCase(parsed.scheme, "http") and
+        !std.ascii.eqlIgnoreCase(parsed.scheme, "https"))
+    {
+        return false;
+    }
+    if (parsed.host != null and parsed.host.?.isEmpty()) {
+        return false;
+    }
+
+    const cw = currentWindow();
+    cw.backend.openURL(url) catch |err| {
+        logError(@src(), err, "Could not open url '{s}'", .{url});
+        return false;
+    };
+    return true;
 }
 
-/// Captures dvui drawing to part of the screen in a `Texture`.
-pub const Picture = struct {
-    r: Rect.Physical, // pixels captured
-    texture: dvui.TextureTarget,
-    target: dvui.RenderTarget,
+test openURL {
+    try std.testing.expect(openURL("notepad.exe") == false);
+    try std.testing.expect(openURL("https://") == false);
+    try std.testing.expect(openURL("file:///") == false);
+}
 
-    /// Begin recording drawing to the physical pixels in rect (enlarged to pixel boundaries).
-    ///
-    /// Returns null in case of failure (e.g. if backend does not support texture targets, if the passed rect is empty ...).
-    ///
-    /// Only valid between `Window.begin`and `Window.end`.
-    pub fn start(rect: Rect.Physical) ?Picture {
-        if (rect.empty()) {
-            log.err("Picture.start() was called with an empty rect", .{});
-            return null;
-        }
-
-        var r = rect;
-        // enlarge texture to pixels boundaries
-        const x_start = @floor(r.x);
-        const x_end = @ceil(r.x + r.w);
-        r.x = x_start;
-        r.w = @round(x_end - x_start);
-
-        const y_start = @floor(r.y);
-        const y_end = @ceil(r.y + r.h);
-        r.y = y_start;
-        r.h = @round(y_end - y_start);
-
-        const texture = dvui.textureCreateTarget(@intFromFloat(r.w), @intFromFloat(r.h), .linear) catch return null;
-        const target = dvui.renderTarget(.{ .texture = texture, .offset = r.topLeft() });
-
-        return .{
-            .r = r,
-            .texture = texture,
-            .target = target,
-        };
-    }
-
-    /// Stop recording.
-    pub fn stop(self: *Picture) void {
-        _ = dvui.renderTarget(self.target);
-    }
-
-    /// Encode texture as png.  Call after `stop` before `deinit`.
-    pub fn png(self: *Picture, allocator: std.mem.Allocator) Backend.TextureError![]u8 {
-        const pma_pixels = try dvui.textureReadTarget(allocator, self.texture);
-        const pixels = Color.PMA.sliceToRGBA(pma_pixels);
-        defer allocator.free(pixels);
-
-        return try dvui.pngEncode(allocator, pixels, self.texture.width, self.texture.height, .{});
-    }
-
-    /// Draw recorded texture and destroy it.
-    pub fn deinit(self: *Picture) void {
-        widgetFree(self);
-        // Ignore errors as drawing is not critical to Pictures function
-        const texture = dvui.textureFromTarget(self.texture) catch return; // destroys self.texture
-        dvui.textureDestroyLater(texture);
-        dvui.renderTexture(texture, .{ .r = self.r }, .{}) catch {};
-        self.* = undefined;
-    }
-};
-
+// PNG handling {{{
 pub const pngEncodeOptions = struct {
     /// Physical size of image, pixels per meter added to png pHYs chunk.
     /// 0 => don't write the pHYs chunk
@@ -7285,28 +7343,8 @@ pub fn png_crc32(buf: []u8) u32 {
     }
     return ~crc;
 }
-
-pub fn plot(src: std.builtin.SourceLocation, plot_opts: PlotWidget.InitOptions, opts: Options) *PlotWidget {
-    var ret = widgetAlloc(PlotWidget);
-    ret.* = PlotWidget.init(src, plot_opts, opts);
-    ret.install();
-    return ret;
-}
-
-pub fn plotXY(src: std.builtin.SourceLocation, plot_opts: PlotWidget.InitOptions, thick: f32, xs: []const f64, ys: []const f64, opts: Options) void {
-    const defaults: Options = .{ .padding = .{} };
-    var p = dvui.plot(src, plot_opts, defaults.override(opts));
-
-    var s1 = p.line();
-    for (xs, ys) |x, y| {
-        s1.point(x, y);
-    }
-
-    s1.stroke(thick, opts.color(.accent));
-
-    s1.deinit();
-    p.deinit();
-}
+// }}}
+// }}}
 
 /// Helper to layout widgets stacked vertically or horizontally.
 ///
