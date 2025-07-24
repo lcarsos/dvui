@@ -1027,10 +1027,8 @@ fn addTextEx(self: *TextLayoutWidget, text: []const u8, action: AddTextExAction,
         }
 
         var end: usize = undefined;
-
         // get slice of text that fits within width or ends with newline
         var s = options.fontGet().textSizeEx(txt, if (self.break_lines) width else null, &end, .before);
-
         // ensure we always get at least 1 codepoint so we make progress
         if (end == 0) {
             end = std.unicode.utf8ByteSequenceLength(txt[0]) catch 1;
@@ -1481,6 +1479,9 @@ pub fn rectFor(self: *TextLayoutWidget, id: dvui.WidgetId, min_size: Size, e: Op
     var ret = dvui.placeIn(self.data().backgroundRect().justSize(), min_size, e, g);
     ret.x -= self.data().options.paddingGet().x;
     ret.y -= self.data().options.paddingGet().y;
+
+    ret.x = self.insert_pt.x;
+    ret.y = self.insert_pt.y;
 
     const i: usize = if (g.y < 0.5) if (g.x < 0.5)
         0 // upleft
