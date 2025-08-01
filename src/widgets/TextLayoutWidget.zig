@@ -1480,6 +1480,14 @@ pub fn rectFor(self: *TextLayoutWidget, id: dvui.WidgetId, min_size: Size, e: Op
     ret.x -= self.data().options.paddingGet().x;
     ret.y -= self.data().options.paddingGet().y;
 
+    const content = self.data().contentRect();
+    const line_remaining = content.w - self.insert_pt.x;
+    if (line_remaining < min_size.w) {
+        self.lineBreak();
+        self.insert_pt.x = ret.x;
+        self.insert_pt.y += self.current_line_height;
+    }
+
     ret.x = self.insert_pt.x;
     ret.y = self.insert_pt.y;
 
